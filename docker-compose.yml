@@ -1,0 +1,13 @@
+services:
+  asana-migration:
+    build: .
+    ports:
+      # `serve` auto-starts (see Dockerfile CMD)
+      - "5050:5050"
+    volumes:
+      # Bind mounts (not named volumes): data lands directly in these folders
+      # on your machine, browsable with a normal file manager, and survives
+      # `docker compose down` / image rebuilds.
+      - ./data:/app/data
+      - ./var:/app/var
+    restart: unless-stopped

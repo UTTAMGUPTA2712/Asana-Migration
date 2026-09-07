@@ -35,7 +35,7 @@ personally have access to.
 
 ```bash
 uv sync
-uv run asana-migration serve
+uv run serve
 ```
 
 This opens `http://127.0.0.1:5050` in your browser (use `--port`, `--host`,
@@ -89,7 +89,7 @@ exact layout.
 ## Or: run the whole export in one go, from the terminal
 
 ```bash
-uv run asana-migration import-all
+uv run import-all
 ```
 
 Prompts for a token if none is saved yet, then discovers every workspace,
@@ -116,7 +116,32 @@ single job, so re-running `import-all` (or opening the web UI) picks up
 exactly where it stopped. It shares the same `var/`/`data/` directories as
 `serve`, so work started one way can be finished the other.
 
-### Pagination (>100 records per Asana call)
+## Or: run it in Docker
+
+```bash
+docker compose up -d --build
+```
+
+`serve` starts automatically — open `http://localhost:5050`. It comes back
+on its own after a rebuild/recreate (`restart: unless-stopped` + baked into
+the image's `CMD`), so there's no manual step and no risk of the container
+showing "Up" while nothing's actually listening.
+
+For `import-all` (or anything else), open a shell in the same running
+container - it runs safely alongside the auto-started `serve`, sharing the
+same mounted `data/`/`var/` (the job queue is safe for concurrent access):
+
+```bash
+docker compose exec asana-migration bash
+import-all
+```
+
+`./data` and `./var` are bind mounts, not Docker volumes - the container
+writes directly into those folders in your project directory on disk, so
+they're browsable with a normal file manager and untouched by `docker
+compose down` or an image rebuild.
+
+## Pagination (>100 records per Asana call)
 
 Asana caps every list endpoint at 100 records per page. `AsanaClient.paginate()`
 follows the `next_page.offset` cursor Asana returns until it runs out, so

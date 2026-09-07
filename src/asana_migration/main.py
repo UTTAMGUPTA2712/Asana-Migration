@@ -1,13 +1,17 @@
 """CLI entry point.
 
-    asana-migration serve            # start the web UI + background importer
-    asana-migration serve --port 5050 --no-browser
+    uv run serve                     # start the web UI + background importer
+    uv run serve --port 5050 --no-browser
 
-    asana-migration import-all       # run the ENTIRE export in one foreground
+    uv run import-all                # run the ENTIRE export in one foreground
                                       # run: every team, every project, every
                                       # task/subtask/comment - rate-limited,
                                       # resumable, logging every step.
-    asana-migration import-all --force --rate-limit 60 -v
+    uv run import-all --force --rate-limit 60 -v
+
+(`uv run asana-migration serve` / `asana-migration import-all` work too, if
+installed outside a `uv run` context - all three console scripts point at
+the same subcommands below.)
 
 Everything else (setting the token from the browser, importing one project at
 a time) is done from the web UI this launches -- see webapp.py. `import-all`
@@ -22,6 +26,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import logging
+import sys
 import time
 import webbrowser
 from pathlib import Path
@@ -201,7 +206,7 @@ def _cmd_import_all(args: argparse.Namespace) -> None:
     )
     if stats["error"]:
         log.warning("Some jobs failed permanently after retries. Re-run `import-all` to retry just those.")
-    log.info("Data written under ./data - browse it with `asana-migration serve`.")
+    log.info("Data written under ./data - browse it with `uv run serve`.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -230,12 +235,23 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if not getattr(args, "command", None):
         args = parser.parse_args(["serve"])
     args.func(args)
+
+
+def serve_main() -> None:
+    """Console-script entry point for `serve` (and `uv run serve`) - same as
+    `asana-migration serve`, just without the prefix."""
+    main(["serve", *sys.argv[1:]])
+
+
+def import_all_main() -> None:
+    """Console-script entry point for `import-all` (and `uv run import-all`)."""
+    main(["import-all", *sys.argv[1:]])
 
 
 if __name__ == "__main__":
