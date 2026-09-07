@@ -1,16 +1,19 @@
 [project]
 name = "asana-migration"
 version = "0.1.0"
-description = "Add your description here"
+description = "Slow, resumable, rate-limit-safe exporter of an Asana account (teams/projects/sections/tasks/subtasks/comments/collaborators) to a browsable local JSON folder tree, with a local web UI."
 readme = "README.md"
 authors = [
     { name = "Uttam Gupta", email = "uttam.1128@zenmonk.tech" }
 ]
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "requests>=2.34.2",
+    "flask>=3.0.0",
+]
 
 [project.scripts]
-asana-migration = "asana_migration:main"
+asana-migration = "asana_migration.main:main"
 
 [build-system]
 requires = ["uv_build>=0.12.4,<0.13.0"]

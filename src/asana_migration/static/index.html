@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Asana Export</title>
+<style>
+  :root {
+    --bg: #f6f7f8; --panel: #ffffff; --border: #e2e5e9; --text: #1c2128; --muted: #6b7280;
+    --brand: #d1573f; --brand-dark: #b8442e; --ok: #1f9254; --ok-bg: #e6f6ed;
+    --warn: #a06a00; --warn-bg: #fff4dd; --err: #b3261e; --err-bg: #fdeceb;
+    --queued-bg: #eef0f3;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+         background: var(--bg); color: var(--text); }
+  header { display: flex; align-items: center; justify-content: space-between; padding: 12px 20px;
+           background: var(--panel); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 5; }
+  header h1 { font-size: 16px; margin: 0; display: flex; align-items: center; gap: 8px; }
+  header h1 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--brand); display: inline-block; }
+  .crumbs { font-size: 13px; color: var(--muted); }
+  .crumbs a { color: var(--brand); text-decoration: none; cursor: pointer; }
+  .crumbs a:hover { text-decoration: underline; }
+  #queueBadge { font-size: 12px; color: var(--muted); padding: 4px 10px; border-radius: 999px; background: var(--queued-bg); }
+  #queueBadge.active { color: var(--warn); background: var(--warn-bg); }
+  main { max-width: 1000px; margin: 0 auto; padding: 24px 20px 80px; }
+  .hidden { display: none !important; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 20px; }
+  .center-card { max-width: 420px; margin: 60px auto; text-align: center; }
+  .center-card p { color: var(--muted); font-size: 14px; }
+  input[type=text], input[type=password], input[type=number] {
+    width: 100%; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; font-size: 14px; margin: 8px 0 4px;
+  }
+  button { font-size: 14px; padding: 9px 16px; border-radius: 8px; border: 1px solid var(--border);
+           background: var(--panel); color: var(--text); cursor: pointer; }
+  button:hover { border-color: #c7cbd1; }
+  button.primary { background: var(--brand); border-color: var(--brand); color: white; }
+  button.primary:hover { background: var(--brand-dark); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.small { padding: 5px 10px; font-size: 12px; }
+  .error-banner { background: var(--err-bg); color: var(--err); border: 1px solid #f3c6c2; padding: 10px 14px;
+                  border-radius: 8px; margin-bottom: 16px; font-size: 13px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 14px; margin-top: 16px; }
+  .tile { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; cursor: pointer; }
+  .tile:hover { border-color: var(--brand); }
+  .tile h3 { margin: 0 0 6px; font-size: 14px; }
+  .tile .sub { font-size: 12px; color: var(--muted); }
+  .badge { display: inline-block; font-size: 11px; padding: 3px 8px; border-radius: 999px; font-weight: 600; }
+  .badge.not_imported { background: var(--queued-bg); color: var(--muted); }
+  .badge.importing { background: var(--warn-bg); color: var(--warn); }
+  .badge.complete { background: var(--ok-bg); color: var(--ok); }
+  .badge.error { background: var(--err-bg); color: var(--err); }
+  .progress { height: 5px; border-radius: 3px; background: var(--queued-bg); margin-top: 8px; overflow: hidden; }
+  .progress > div { height: 100%; background: var(--brand); }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 4px; flex-wrap: wrap; }
+  .toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 4px; }
+  h2 { font-size: 20px; margin: 0 0 4px; }
+  .muted { color: var(--muted); font-size: 13px; }
+  .section-block { margin-top: 22px; }
+  .section-block h4 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted);
+                       border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  ul.task-list { list-style: none; margin: 6px 0 0; padding: 0; }
+  ul.task-list ul.task-list { padding-left: 22px; border-left: 2px solid var(--border); margin-left: 6px; }
+  .task-row { display: flex; align-items: center; gap: 8px; padding: 6px 4px; border-radius: 6px; cursor: pointer; font-size: 13.5px; }
+  .task-row:hover { background: var(--queued-bg); }
+  .task-row .name { flex: 1; }
+  .task-row.done .name { text-decoration: line-through; color: var(--muted); }
+  .task-row .tag { font-size: 11px; color: var(--muted); background: var(--queued-bg); padding: 1px 6px; border-radius: 999px; }
+  .modal-backdrop { position: fixed; inset: 0; background: rgba(20,22,26,.4); display: flex; align-items: flex-start;
+                    justify-content: center; padding: 40px 16px; z-index: 20; }
+  .modal { background: var(--panel); border-radius: 12px; max-width: 640px; width: 100%; max-height: 85vh;
+           overflow-y: auto; padding: 24px; }
+  .modal h3 { margin-top: 0; }
+  .comment { border-top: 1px solid var(--border); padding: 10px 0; font-size: 13px; }
+  .comment .meta { color: var(--muted); font-size: 11px; margin-bottom: 4px; }
+  .chip-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .chip { background: var(--queued-bg); border-radius: 999px; padding: 3px 10px; font-size: 12px; }
+  .settings-pop { position: absolute; right: 20px; top: 52px; background: var(--panel); border: 1px solid var(--border);
+                  border-radius: 10px; padding: 16px; width: 260px; box-shadow: 0 8px 24px rgba(0,0,0,.08); z-index: 10; }
+  label.field-label { font-size: 12px; color: var(--muted); display: block; margin-top: 10px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1><span class="dot"></span> Asana Export <span class="crumbs" id="crumbs"></span></h1>
+  <div class="row" style="gap:10px;">
+    <span id="queueBadge">idle</span>
+    <button class="small" id="settingsBtn">⚙ Settings</button>
+  </div>
+</header>
+
+<div id="settingsPop" class="settings-pop hidden">
+  <label class="field-label">Requests per minute (rate limit)</label>
+  <input type="number" id="rpmInput" min="10" max="1000">
+  <label class="field-label">Max subtask nesting depth</label>
+  <input type="number" id="depthInput" min="1" max="20" disabled>
+  <div class="row" style="margin-top:12px;">
+    <button class="small" id="saveSettingsBtn">Save</button>
+    <button class="small" id="changeTokenBtn">Change token</button>
+  </div>
+</div>
+
+<main>
+  <div id="errorBanner" class="error-banner hidden"></div>
+
+  <!-- Token screen -->
+  <section id="view-token" class="hidden">
+    <div class="card center-card">
+      <h2>Connect your Asana account</h2>
+      <p>Paste a Personal Access Token from Asana (My Settings → Apps → Developer apps → Personal access tokens).
+         It's stored only in <code>var/config.json</code> on this machine.</p>
+      <input type="password" id="tokenInput" placeholder="0/1234567890abcdef...">
+      <button class="primary" id="connectBtn" style="width:100%; margin-top:10px;">Connect</button>
+    </div>
+  </section>
+
+  <!-- Teams screen -->
+  <section id="view-teams" class="hidden">
+    <div class="toolbar">
+      <h2 style="flex:1">Teams</h2>
+      <button class="primary" id="importTeamsBtn">Import teams</button>
+    </div>
+    <p class="muted">Pulls your workspaces and teams from Asana (a couple of lightweight calls) and caches them locally.
+       Everything below this is read from that local cache until you ask to import more.</p>
+    <div id="teamsEmpty" class="card hidden" style="text-align:center; margin-top:20px;">
+      <p>No teams imported yet. Click <strong>Import teams</strong> to fetch your workspaces & teams.</p>
+    </div>
+    <div id="teamsGrid" class="grid"></div>
+  </section>
+
+  <!-- Team detail: projects -->
+  <section id="view-team" class="hidden">
+    <div class="toolbar">
+      <h2 id="teamTitle" style="flex:1"></h2>
+      <button class="small" id="refreshProjectsBtn">Refresh project list</button>
+      <button class="primary" id="importAllBtn">Import all projects</button>
+    </div>
+    <p class="muted">Each project is imported on its own, slowly, in the background so we never exceed Asana's rate
+       limit. Cards below update automatically while an import runs.</p>
+    <div id="projectsGrid" class="grid"></div>
+  </section>
+
+  <!-- Project detail -->
+  <section id="view-project" class="hidden">
+    <div class="toolbar">
+      <h2 id="projectTitle" style="flex:1"></h2>
+      <span id="projectBadge" class="badge"></span>
+      <button class="primary hidden" id="importProjectBtn">Import this project</button>
+    </div>
+    <div id="projectMeta" class="muted"></div>
+    <div class="progress hidden" id="projectProgressWrap"><div id="projectProgressBar" style="width:0%"></div></div>
+
+    <div class="section-block">
+      <h4>Members</h4>
+      <div id="membersList" class="chip-list"></div>
+    </div>
+
+    <div class="section-block">
+      <h4>Sections &amp; tasks</h4>
+      <div id="taskTree"></div>
+    </div>
+  </section>
+</main>
+
+<div id="taskModalBackdrop" class="modal-backdrop hidden">
+  <div class="modal">
+    <button class="small" style="float:right" id="closeModalBtn">Close</button>
+    <div id="taskModalBody">Loading…</div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
