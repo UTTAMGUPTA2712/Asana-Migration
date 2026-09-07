@@ -327,8 +327,12 @@ async function openTaskModal(taskGid, name) {
       </div>`).join("") || `<p class="muted">No comments.</p>`;
     const attachments = (data.attachments || []).map((a) => {
       // Metadata + link only, nothing is downloaded - see importer.py.
+      // permanent_url first: it's the one that doesn't expire and actually
+      // enforces Asana permissions (view_url/download_url are the same
+      // short-lived pre-signed link, which bypasses permission checks for
+      // its brief life - see the attachment-links conversation).
       const label = escapeHtml(a.name || a.gid) + ` (${escapeHtml(a.host)})`;
-      const href = a.view_url || a.permanent_url || a.download_url || "#";
+      const href = a.permanent_url || a.view_url || a.download_url || "#";
       return `<div class="comment"><a href="${href}" target="_blank" rel="noopener">📎 ${label}</a></div>`;
     }).join("") || `<p class="muted">No attachments.</p>`;
     const activity = (data.stories || []).filter((s) => s.type !== "comment").map((s) => `

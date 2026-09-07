@@ -58,9 +58,11 @@ class _WorkerThread:
         return self.thread.is_alive()
 
     def _run(self) -> None:
+        # Runs as this thread's own target, so every log call below picks up
+        # this thread's name automatically via the app's %(threadName)s log
+        # format - no need to prepend it manually here.
         queue: JobQueue = self.ctx.queue
-        name = self.thread.name
-        log.info("%s: started", name)
+        log.info("started")
         while not self.stop_event.is_set():
             # This whole body is guarded: an exception that escapes it kills
             # this thread silently, shrinking the pool with no visible
@@ -74,17 +76,17 @@ class _WorkerThread:
                 if handler is None:
                     queue.fail(job.id, f"no handler registered for job type {job.type!r}")
                     continue
-                log.debug("%s: job #%d: %s %s", name, job.id, job.type, job.payload)
+                log.debug("job #%d: %s %s", job.id, job.type, job.payload)
                 try:
                     handler(self.ctx, job.payload)
                     queue.complete(job.id)
                 except Exception as exc:  # noqa: BLE001 - job errors must not kill the worker
-                    log.warning("%s: job %s (%s) failed: %s", name, job.id, job.type, exc)
+                    log.warning("job %s (%s) failed: %s", job.id, job.type, exc)
                     queue.fail(job.id, str(exc))
             except Exception as exc:  # noqa: BLE001 - last-resort guard, see comment above
-                log.error("%s hit an unexpected error, will keep going: %s", name, exc)
+                log.error("hit an unexpected error, will keep going: %s", exc)
                 time.sleep(self.poll_interval)
-        log.info("%s: stopped", name)
+        log.info("stopped")
 
 
 class WorkerPool:

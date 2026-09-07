@@ -304,8 +304,7 @@ def h_import_task(ctx: ImporterContext, payload: dict) -> None:
 
     comments = read_json(task_dir / "comments.json", default=None)
     attachments = read_json(task_dir / "attachments.json", default=None)
-    TaskIndex(project_dir).update_entry(
-        task_gid,
+    index_fields = dict(
         name=task.get("name"),
         completed=task.get("completed", False),
         depth=depth,
@@ -315,10 +314,17 @@ def h_import_task(ctx: ImporterContext, payload: dict) -> None:
         num_subtasks=task.get("num_subtasks", 0),
         assignee=(task.get("assignee") or {}).get("name"),
         status="imported",
-        comments_count=len(comments) if comments is not None else 0,
-        attachments_count=len(attachments) if attachments is not None else 0,
     )
-    Meta(project_dir).increment("tasks_imported", 1)
+    # Only set *_count once genuinely known - not "0 meaning not fetched
+    # yet" - so project_view() can tell "fetched, turned out to be empty"
+    # apart from "not fetched yet" purely from whether the key is present.
+    if comments is not None:
+        index_fields["comments_count"] = len(comments)
+    if attachments is not None:
+        index_fields["attachments_count"] = len(attachments)
+    TaskIndex(project_dir).update_entry(task_gid, **index_fields)
+    # tasks_imported is derived from the index itself in project_view(), not
+    # tracked here - see the comment there for why.
 
     if comments is None:
         ctx.queue.push(
@@ -365,8 +371,8 @@ def h_import_task_comments(ctx: ImporterContext, payload: dict) -> None:
     comments = [s for s in stories if s.get("type") == "comment"]
     write_json(task_dir / "stories.json", stories)
     write_json(task_dir / "comments.json", comments)
-    Meta(project_dir).increment("comments_imported", 1)
     TaskIndex(project_dir).update_entry(task_gid, comments_count=len(comments))
+    # comments_imported is derived from the index itself in project_view()
     log.info(
         "Task %s: saved %d stor(y/ies) (%d comment(s), %d other activity)",
         task_gid, len(stories), len(comments), len(stories) - len(comments),
@@ -456,6 +462,21 @@ def project_view(queue: JobQueue, project_dir: Path, project_gid: str | None = N
     if status == "importing" and pending == 0:
         meta = Meta(project_dir).update(status="complete", completed_at=now_iso())
         status = "complete"
+
+    # tasks_imported/comments_imported come from the actual index, not the
+    # separately-incremented counters in _meta.json: a job that gets reclaimed
+    # as stale (its owning process died or was killed mid-run - see jobs.py)
+    # and reprocessed can call increment() twice for the same completion if
+    # the original execution wasn't actually dead yet, silently inflating the
+    # counter. The index itself can't be double-counted this way - writing
+    # the same gid's entry twice just overwrites it, so counting its entries
+    # is always accurate regardless of how many times a job ran.
+    index = TaskIndex(project_dir).read()
+    accurate_imported = len(index)
+    accurate_comments = sum(1 for e in index.values() if "comments_count" in e)
+    if meta.get("tasks_imported") != accurate_imported or meta.get("comments_imported") != accurate_comments:
+        meta = Meta(project_dir).update(tasks_imported=accurate_imported, comments_imported=accurate_comments)
+
     errors = queue.errors_for(matches)
     return {
         "status": status,

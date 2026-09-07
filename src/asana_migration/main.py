@@ -47,7 +47,7 @@ def _default_serve_host() -> str:
 def _cmd_serve(args: argparse.Namespace) -> None:
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format="%(asctime)s %(levelname)s [%(threadName)s] %(name)s: %(message)s",
     )
     from .webapp import create_app
 
@@ -68,7 +68,7 @@ def _cmd_serve(args: argparse.Namespace) -> None:
 def _cmd_import_all(args: argparse.Namespace) -> None:
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        format="%(asctime)s %(levelname)-7s [%(threadName)s] %(name)s: %(message)s",
     )
     # Quiet down third-party request/connection noise unless -v was asked for.
     if not args.verbose:
