@@ -92,10 +92,14 @@ exact layout.
 uv run import-all
 ```
 
-Prompts for a token if none is saved yet, then discovers every workspace,
-team and project and imports all of them — sections, tasks, subtasks (any
-depth), comments, collaborators — in one foreground run, still paced by the
-same rate limiter. It logs what it's doing as it goes:
+Prompts for a token if none is saved yet, and (in an interactive terminal)
+prompts for the rate limit on every run too — pre-filled with the current
+saved value, just press Enter to keep it — rather than silently reusing
+whatever's saved with no visibility into what that is. Then it discovers
+every workspace, team and project and imports all of them — sections,
+tasks, subtasks (any depth), comments, collaborators — in one foreground
+run, paced by whatever rate limit you just confirmed. It logs what it's
+doing as it goes:
 
 ```
 11:55:08 INFO  asana_migration.importer: Team team1: found 6 project(s)

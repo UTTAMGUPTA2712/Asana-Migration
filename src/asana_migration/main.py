@@ -86,6 +86,23 @@ def _cmd_import_all(args: argparse.Namespace) -> None:
 
     if args.rate_limit:
         cfg.rate_limit_per_minute = args.rate_limit
+    elif sys.stdin.isatty():
+        # Ask every interactive run (pre-filled with the current/default
+        # value) rather than silently reusing whatever's saved - that
+        # silence is exactly what let a previously-set rate limit go
+        # unnoticed after it got reset.
+        default_rpm = cfg.rate_limit_per_minute or config_mod.DEFAULT_RATE_LIMIT_PER_MINUTE
+        raw = input(f"Rate limit in requests/minute [{default_rpm}]: ").strip()
+        if raw:
+            try:
+                cfg.rate_limit_per_minute = int(raw)
+            except ValueError:
+                log.warning("'%s' isn't a whole number - keeping %d req/min.", raw, default_rpm)
+                cfg.rate_limit_per_minute = default_rpm
+        else:
+            cfg.rate_limit_per_minute = default_rpm
+    # else: non-interactive (piped/backgrounded) - keep the saved/default
+    # value rather than hang on input().
     cfg.token = token
     config_mod.save_config(cfg)
 
