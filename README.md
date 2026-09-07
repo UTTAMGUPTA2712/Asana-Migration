@@ -128,8 +128,7 @@ docker compose up -d --build
 
 `serve` starts automatically — open `http://localhost:5050`. It comes back
 on its own after a rebuild/recreate (`restart: unless-stopped` + baked into
-the image's `CMD`), so there's no manual step and no risk of the container
-showing "Up" while nothing's actually listening.
+the image's `CMD`).
 
 For `import-all` (or anything else), open a shell in the same running
 container - it runs safely alongside the auto-started `serve`, sharing the
@@ -140,10 +139,20 @@ docker compose exec asana-migration bash
 import-all
 ```
 
+`serve` auto-detects it's running in a container (checks for `/.dockerenv`)
+and binds `0.0.0.0` instead of its normal-elsewhere default of `127.0.0.1`
+— so plain `serve`, with no `--host` flag, is correct both inside Docker
+and out. (`127.0.0.1` inside a container is only reachable from inside that
+container's own network namespace - Docker's port mapping can't forward to
+it no matter how the mapping itself is set up.)
+
 `./data` and `./var` are bind mounts, not Docker volumes - the container
 writes directly into those folders in your project directory on disk, so
 they're browsable with a normal file manager and untouched by `docker
-compose down` or an image rebuild.
+compose down` or an image rebuild. `./src` is bind-mounted too, so local
+code edits take effect in the running container immediately (it's an
+editable install) — only changes to `pyproject.toml`/`uv.lock` (new deps,
+new console scripts) need a rebuild.
 
 ## Pagination (>100 records per Asana call)
 

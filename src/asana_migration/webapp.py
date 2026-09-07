@@ -22,6 +22,7 @@ from .importer import (
     ImporterContext,
     build_task_tree,
     ensure_other_projects_index,
+    ensure_team_members,
     ensure_team_projects_index,
     import_workspaces_and_teams,
     project_view,
@@ -160,8 +161,16 @@ def create_app() -> Flask:
                         team = read_json(team_dir / "team.json")
                         if team:
                             teams.append(team)
-                out.append({"workspace": ws, "teams": teams})
+                tags = read_json(ws_dir / "tags.json", default=[]) or []
+                out.append({"workspace": ws, "teams": teams, "tags_count": len(tags)})
         return jsonify({"workspaces": out, "imported": bool(out)})
+
+    @app.get("/api/workspaces/<workspace_gid>/tags")
+    def api_workspace_tags(workspace_gid):
+        ws_dir = state.paths.find_workspace_dir_anywhere(workspace_gid)
+        if not ws_dir:
+            return error_response(Exception(f"Workspace {workspace_gid} not imported locally yet."), 404)
+        return jsonify({"tags": read_json(ws_dir / "tags.json", default=[])})
 
     def _team_dir_or_404(team_gid: str) -> Path:
         team_dir = state.paths.find_team_dir_anywhere(team_gid)
@@ -205,6 +214,11 @@ def create_app() -> Flask:
             state.require_client()
             cached = _projects_index_for(team_dir, team_gid, workspace_dir)
 
+        members = read_json(team_dir / "members.json")
+        if members is None and not team_gid.startswith(OTHER_PROJECTS_TEAM_GID_PREFIX):
+            state.require_client()
+            members = ensure_team_members(state.ctx, team_dir, team_gid)
+
         projects = []
         for p in cached:
             project_dir = state.paths.project_dir(workspace_dir, p["gid"], p.get("name"))
@@ -212,6 +226,7 @@ def create_app() -> Flask:
             projects.append({**p, **view})
         return jsonify({
             "team": read_json(team_dir / "team.json"),
+            "members": members or [],
             "projects": projects,
         })
 
@@ -289,6 +304,7 @@ def create_app() -> Flask:
         return jsonify({
             "task": read_json(task_dir / "task.json", default={}),
             "comments": read_json(task_dir / "comments.json", default=[]),
+            "stories": read_json(task_dir / "stories.json", default=[]),
             "collaborators": read_json(task_dir / "collaborators.json", default=[]),
             "attachments": read_json(task_dir / "attachments.json", default=[]),
             "index_entry": entry,

@@ -11,6 +11,9 @@ just hold lightweight indexes pointing into those pools::
     data/
       <workspace_gid>_<slug>/
         workspace.json
+        tags.json                        # every tag in the workspace (color,
+                                          # notes, ...) - tasks only carry
+                                          # {gid, name} refs to these
         projects/                        # every project, fetched once
           <project_gid>_<slug>/
             project.json    # project fields
@@ -23,18 +26,23 @@ just hold lightweight indexes pointing into those pools::
         tasks/                            # every task/subtask, fetched once
           <task_gid>_<slug>/
             task.json
-            comments.json       # stories of type "comment"
-            collaborators.json  # followers, resolved
-            attachments.json    # attachment metadata + links (all hosts) -
-                                 #   never downloaded, view_url/permanent_url/
-                                 #   download_url only (the last expires fast)
+            stories.json         # every story - comments AND the system-
+                                  #   generated activity log (status changes,
+                                  #   reassignment, section moves, ...)
+            comments.json        # just the type=="comment" subset of stories.json
+            collaborators.json   # followers, resolved
+            attachments.json     # attachment metadata + links (all hosts) -
+                                  #   never downloaded, view_url/permanent_url/
+                                  #   download_url only (the last expires fast)
         teams/
           <team_gid>_<slug>/
             team.json
-            projects_index.json   # [{gid, name, archived, ...}, ...] from
-                                   # GET /teams/{gid}/projects - a pointer
-                                   # list into data/<workspace>/projects/,
-                                   # not a copy of the project data itself
+            members.json           # who's actually on this team (distinct
+                                    #   from a project's own `members`)
+            projects_index.json    # [{gid, name, archived, ...}, ...] from
+                                    # GET /teams/{gid}/projects - a pointer
+                                    # list into data/<workspace>/projects/,
+                                    # not a copy of the project data itself
 
 Every directory that represents an importable "thing" also gets a
 ``_meta.json`` recording status/progress/timestamps, which is what the web UI

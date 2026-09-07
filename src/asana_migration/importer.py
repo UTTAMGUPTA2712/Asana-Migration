@@ -65,6 +65,11 @@ def import_workspaces_and_teams(ctx: ImporterContext) -> list[dict]:
             teams_out.append({"gid": team["gid"], "name": team.get("name"), "dir": str(team_dir)})
         log.info("Workspace '%s': found %d team(s)", ws.get("name"), len(teams_out))
 
+        log.info("Workspace '%s': fetching tags...", ws.get("name"))
+        tags = list(ctx.client.get_tags_for_workspace(ws["gid"]))
+        write_json(ws_dir / "tags.json", tags)
+        log.info("Workspace '%s': found %d tag(s)", ws.get("name"), len(tags))
+
         # A synthetic "team" for projects you can see in this workspace but
         # that aren't on any team you belong to (org-public projects, or
         # ones you were added to individually) - GET /teams/{gid}/projects
@@ -96,6 +101,24 @@ def ensure_team_projects_index(ctx: ImporterContext, team_dir: Path, team_gid: s
     log.info("Team %s: found %d project(s)", team_gid, len(projects))
     write_json(index_path, projects)
     return projects
+
+
+def ensure_team_members(ctx: ImporterContext, team_dir: Path, team_gid: str, force: bool = False) -> list[dict]:
+    """Who's actually on this team, cached to disk - distinct from a
+    project's own `members` (which is a different Asana relationship).
+    Skipped for the synthetic "other projects" team, which has no members."""
+    if team_gid.startswith(OTHER_PROJECTS_TEAM_GID_PREFIX):
+        return []
+    members_path = team_dir / "members.json"
+    if not force:
+        cached = read_json(members_path)
+        if cached is not None:
+            return cached
+    log.info("Team %s: listing members...", team_gid)
+    members = list(ctx.client.get_users_for_team(team_gid))
+    log.info("Team %s: found %d member(s)", team_gid, len(members))
+    write_json(members_path, members)
+    return members
 
 
 def ensure_other_projects_index(
@@ -329,17 +352,25 @@ def h_import_task(ctx: ImporterContext, payload: dict) -> None:
 
 
 def h_import_task_comments(ctx: ImporterContext, payload: dict) -> None:
+    """Saves both `stories.json` (everything - comments and the full
+    system-generated activity log) and `comments.json` (just the
+    `type == "comment"` subset, kept separately since that's what the UI's
+    Comments panel and the `comments_imported` progress counter use)."""
     workspace_dir = Path(payload["workspace_dir"])
     project_dir = Path(payload["project_dir"])
     task_gid = payload["task_gid"]
     task_dir = ctx.paths.task_dir(workspace_dir, task_gid)
-    log.info("Task %s: fetching comments...", task_gid)
+    log.info("Task %s: fetching stories (comments + activity)...", task_gid)
     stories = list(ctx.client.get_stories_for_task(task_gid))
     comments = [s for s in stories if s.get("type") == "comment"]
+    write_json(task_dir / "stories.json", stories)
     write_json(task_dir / "comments.json", comments)
     Meta(project_dir).increment("comments_imported", 1)
     TaskIndex(project_dir).update_entry(task_gid, comments_count=len(comments))
-    log.info("Task %s: saved %d comment(s)", task_gid, len(comments))
+    log.info(
+        "Task %s: saved %d stor(y/ies) (%d comment(s), %d other activity)",
+        task_gid, len(stories), len(comments), len(stories) - len(comments),
+    )
 
 
 def h_import_task_attachments(ctx: ImporterContext, payload: dict) -> None:

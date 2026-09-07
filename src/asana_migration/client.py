@@ -118,6 +118,15 @@ class AsanaClient:
     def get_team(self, team_gid: str) -> dict:
         return self.get(f"/teams/{team_gid}", {"opt_fields": "gid,name,description,organization.name"})["data"]
 
+    def get_users_for_team(self, team_gid: str) -> Iterable[dict]:
+        yield from self.paginate(f"/teams/{team_gid}/users", {"opt_fields": "gid,name,email"})
+
+    def get_tags_for_workspace(self, workspace_gid: str) -> Iterable[dict]:
+        yield from self.paginate(
+            f"/workspaces/{workspace_gid}/tags",
+            {"opt_fields": "gid,name,color,notes,created_at,followers.gid,followers.name"},
+        )
+
     def get_projects_for_team(self, team_gid: str) -> Iterable[dict]:
         # No `archived` filter: this is a full export, so archived projects
         # are included too (each result carries its own `archived` field so
@@ -179,7 +188,15 @@ class AsanaClient:
         yield from self.paginate(f"/tasks/{task_gid}/subtasks", {"opt_fields": "gid,name,resource_type"})
 
     def get_stories_for_task(self, task_gid: str) -> Iterable[dict]:
-        fields = "gid,type,resource_subtype,text,html_text,created_at,created_by.gid,created_by.name,created_by.email"
+        """Every story on the task - comments *and* the system-generated
+        activity log (status changes, reassignment, section moves, files
+        attached, ...), not just comments. Callers that want comments only
+        filter by `type == "comment"` on the result."""
+        fields = (
+            "gid,type,resource_subtype,text,html_text,created_at,"
+            "created_by.gid,created_by.name,created_by.email,"
+            "is_pinned,is_edited,sticker_name,num_likes,liked,source"
+        )
         yield from self.paginate(f"/tasks/{task_gid}/stories", {"opt_fields": fields})
 
     def get_attachments_for_task(self, task_gid: str) -> Iterable[dict]:

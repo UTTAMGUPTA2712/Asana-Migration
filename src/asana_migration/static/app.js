@@ -172,6 +172,9 @@ async function loadProjects() {
     clearError();
   } catch (err) { showError(err.message); return; }
 
+  $("teamMembers").innerHTML = (data.members || [])
+    .map((m) => `<span class="chip">${escapeHtml(m.name || m.email || m.gid)}</span>`).join("");
+
   const grid = $("projectsGrid");
   grid.innerHTML = "";
   let anyActive = false;
@@ -327,6 +330,11 @@ async function openTaskModal(taskGid, name) {
       const href = a.view_url || a.permanent_url || a.download_url || "#";
       return `<div class="comment"><a href="${href}" target="_blank" rel="noopener">📎 ${label}</a></div>`;
     }).join("") || `<p class="muted">No attachments.</p>`;
+    const activity = (data.stories || []).filter((s) => s.type !== "comment").map((s) => `
+      <div class="comment">
+        <div class="meta">${escapeHtml((s.created_by || {}).name || "Unknown")} · ${escapeHtml(s.created_at || "")}</div>
+        <div class="muted">${escapeHtml(s.text || s.resource_subtype || "")}</div>
+      </div>`).join("") || `<p class="muted">No other activity.</p>`;
     $("taskModalBody").innerHTML = `
       <h3>${escapeHtml(t.name)}</h3>
       <p class="muted">${t.completed ? "✅ Completed" : "Open"} ${t.due_on ? "· due " + escapeHtml(t.due_on) : ""}
@@ -335,6 +343,7 @@ async function openTaskModal(taskGid, name) {
       <div class="section-block"><h4>Collaborators</h4><div class="chip-list">${collaborators}</div></div>
       <div class="section-block"><h4>Attachments</h4>${attachments}</div>
       <div class="section-block"><h4>Comments</h4>${comments}</div>
+      <div class="section-block"><h4>Other activity</h4>${activity}</div>
     `;
   } catch (err) {
     $("taskModalBody").innerHTML = `<p class="error-banner">${escapeHtml(err.message)}</p>`;

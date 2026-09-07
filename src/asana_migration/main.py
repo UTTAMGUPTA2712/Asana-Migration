@@ -26,12 +26,22 @@ from __future__ import annotations
 import argparse
 import getpass
 import logging
+import os
 import sys
 import time
 import webbrowser
 from pathlib import Path
 
 log = logging.getLogger("asana_migration.import_all")
+
+
+def _default_serve_host() -> str:
+    """127.0.0.1 everywhere except inside a container, where that's
+    unreachable from the host no matter how the port is published (it's
+    Docker's port mapping that can't forward to a loopback-only bind, not
+    anything specific to this app) - so default to 0.0.0.0 there instead.
+    `/.dockerenv` is the standard marker file every Docker container gets."""
+    return "0.0.0.0" if os.path.exists("/.dockerenv") else "127.0.0.1"
 
 
 def _cmd_serve(args: argparse.Namespace) -> None:
@@ -44,6 +54,8 @@ def _cmd_serve(args: argparse.Namespace) -> None:
     app = create_app()
     url = f"http://{args.host}:{args.port}"
     print(f"Asana migration UI running at {url}")
+    if args.host == "0.0.0.0" and os.path.exists("/.dockerenv"):
+        print("(auto-selected 0.0.0.0 - running in a container; pass --host to override)")
     print("Data is written under ./data ; token/queue state under ./var")
     if not args.no_browser:
         try:
@@ -68,6 +80,7 @@ def _cmd_import_all(args: argparse.Namespace) -> None:
         HANDLERS,
         ImporterContext,
         ensure_other_projects_index,
+        ensure_team_members,
         ensure_team_projects_index,
         import_workspaces_and_teams,
         project_view,
@@ -133,6 +146,7 @@ def _cmd_import_all(args: argparse.Namespace) -> None:
         real_teams = [(t["gid"], Path(t["dir"])) for t in ws["teams"] if not t.get("is_virtual")]
         for team in ws["teams"]:
             team_dir = Path(team["dir"])
+            ensure_team_members(ctx, team_dir, team["gid"], force=args.force)
             if team.get("is_virtual"):
                 projects = ensure_other_projects_index(ctx, team_dir, ws["workspace"]["gid"], real_teams, force=args.force)
             else:
@@ -231,7 +245,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command")
 
     serve = sub.add_parser("serve", help="Start the local web UI and background importer.")
-    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--host", default=_default_serve_host())
     serve.add_argument("--port", type=int, default=5050)
     serve.add_argument("--no-browser", action="store_true", help="Don't auto-open a browser tab.")
     serve.set_defaults(func=_cmd_serve)
