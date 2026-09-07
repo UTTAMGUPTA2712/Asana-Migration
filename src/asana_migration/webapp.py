@@ -18,8 +18,10 @@ from flask import Flask, jsonify, request, send_from_directory
 from . import config as config_mod
 from .client import AsanaApiError, AsanaAuthError, AsanaClient
 from .importer import (
+    OTHER_PROJECTS_TEAM_GID_PREFIX,
     ImporterContext,
     build_task_tree,
+    ensure_other_projects_index,
     ensure_team_projects_index,
     import_workspaces_and_teams,
     project_view,
@@ -95,8 +97,6 @@ def create_app() -> Flask:
     def _api_err(exc):
         return error_response(exc, 502)
 
-    # -- static frontend -------------------------------------------------
-
     @app.get("/")
     def index():
         return send_from_directory(STATIC_DIR, "index.html")
@@ -104,8 +104,6 @@ def create_app() -> Flask:
     @app.get("/static/<path:filename>")
     def static_files(filename):
         return send_from_directory(STATIC_DIR, filename)
-
-    # -- app / token state -------------------------------------------------
 
     @app.get("/api/state")
     def api_state():
@@ -139,8 +137,6 @@ def create_app() -> Flask:
     def api_jobs():
         return jsonify(state.queue.stats())
 
-    # -- teams (workspace-level) -------------------------------------------
-
     @app.post("/api/import-teams")
     def api_import_teams():
         state.require_client()
@@ -167,13 +163,33 @@ def create_app() -> Flask:
                 out.append({"workspace": ws, "teams": teams})
         return jsonify({"workspaces": out, "imported": bool(out)})
 
-    # -- one team's projects -------------------------------------------------
-
     def _team_dir_or_404(team_gid: str) -> Path:
         team_dir = state.paths.find_team_dir_anywhere(team_gid)
         if not team_dir:
             raise LookupError(f"Team {team_gid} not imported locally yet. Import teams first.")
         return team_dir
+
+    def _real_team_dirs(workspace_dir: Path, exclude_gid: str) -> list[tuple[str, Path]]:
+        """(gid, dir) for every real team under this workspace - i.e. every
+        team.json that isn't the synthetic "other projects" one."""
+        out = []
+        teams_root = workspace_dir / "teams"
+        if not teams_root.exists():
+            return out
+        for team_dir in teams_root.iterdir():
+            team = read_json(team_dir / "team.json")
+            if team and team.get("gid") != exclude_gid and not team.get("is_virtual"):
+                out.append((team["gid"], team_dir))
+        return out
+
+    def _projects_index_for(team_dir: Path, team_gid: str, workspace_dir: Path, force: bool = False) -> list[dict]:
+        """Dispatches to the right discovery call depending on whether this
+        is a real team or the synthetic "other projects" one."""
+        if team_gid.startswith(OTHER_PROJECTS_TEAM_GID_PREFIX):
+            real_teams = _real_team_dirs(workspace_dir, team_gid)
+            return ensure_other_projects_index(state.ctx, team_dir, team_gid[len(OTHER_PROJECTS_TEAM_GID_PREFIX):],
+                                                real_teams, force=force)
+        return ensure_team_projects_index(state.ctx, team_dir, team_gid, force=force)
 
     @app.get("/api/teams/<team_gid>/projects")
     def api_team_projects(team_gid):
@@ -182,15 +198,16 @@ def create_app() -> Flask:
         except LookupError as exc:
             return error_response(exc, 404)
 
+        workspace_dir = state.paths.workspace_dir_of_team(team_dir)
         index_path = team_dir / "projects_index.json"
         cached = read_json(index_path)
         if cached is None:
             state.require_client()
-            cached = ensure_team_projects_index(state.ctx, team_dir, team_gid)
+            cached = _projects_index_for(team_dir, team_gid, workspace_dir)
 
         projects = []
         for p in cached:
-            project_dir = state.paths.project_dir(team_dir, p["gid"], p.get("name"))
+            project_dir = state.paths.project_dir(workspace_dir, p["gid"], p.get("name"))
             view = project_view(state.queue, project_dir, p["gid"])
             projects.append({**p, **view})
         return jsonify({
@@ -205,7 +222,8 @@ def create_app() -> Flask:
         except LookupError as exc:
             return error_response(exc, 404)
         state.require_client()
-        projects = ensure_team_projects_index(state.ctx, team_dir, team_gid, force=True)
+        workspace_dir = state.paths.workspace_dir_of_team(team_dir)
+        projects = _projects_index_for(team_dir, team_gid, workspace_dir, force=True)
         return jsonify({"projects": projects})
 
     @app.post("/api/teams/<team_gid>/import-all")
@@ -215,9 +233,8 @@ def create_app() -> Flask:
         except LookupError as exc:
             return error_response(exc, 404)
         state.require_client()
-        cached = read_json(team_dir / "projects_index.json") or ensure_team_projects_index(
-            state.ctx, team_dir, team_gid
-        )
+        workspace_dir = state.paths.workspace_dir_of_team(team_dir)
+        cached = read_json(team_dir / "projects_index.json") or _projects_index_for(team_dir, team_gid, workspace_dir)
         queued = 0
         for p in cached:
             job = state.queue.push(
@@ -243,15 +260,14 @@ def create_app() -> Flask:
         )
         return jsonify({"queued": job is not None})
 
-    # -- one project's detail (sections/tasks/subtasks tree) -----------------
-
     @app.get("/api/teams/<team_gid>/projects/<project_gid>")
     def api_project_detail(team_gid, project_gid):
         try:
             team_dir = _team_dir_or_404(team_gid)
         except LookupError as exc:
             return error_response(exc, 404)
-        project_dir = state.paths.project_dir(team_dir, project_gid)
+        workspace_dir = state.paths.workspace_dir_of_team(team_dir)
+        project_dir = state.paths.project_dir(workspace_dir, project_gid)
         view = project_view(state.queue, project_dir, project_gid)
         members = read_json(project_dir / "members.json", default=[]) or []
         sections = read_json(project_dir / "sections.json", default=[]) or []
@@ -264,16 +280,28 @@ def create_app() -> Flask:
             team_dir = _team_dir_or_404(team_gid)
         except LookupError as exc:
             return error_response(exc, 404)
-        project_dir = state.paths.project_dir(team_dir, project_gid)
+        workspace_dir = state.paths.workspace_dir_of_team(team_dir)
+        project_dir = state.paths.project_dir(workspace_dir, project_gid)
         entry = TaskIndex(project_dir).read().get(task_gid)
         if not entry:
             return error_response(Exception("Task not imported locally yet."), 404)
-        task_dir = project_dir / entry["path"]
+        task_dir = state.paths.task_dir(workspace_dir, task_gid)
         return jsonify({
             "task": read_json(task_dir / "task.json", default={}),
             "comments": read_json(task_dir / "comments.json", default=[]),
             "collaborators": read_json(task_dir / "collaborators.json", default=[]),
+            "attachments": read_json(task_dir / "attachments.json", default=[]),
             "index_entry": entry,
         })
+
+    @app.get("/api/teams/<team_gid>/projects/<project_gid>/tasks/<task_gid>/attachments/<path:filename>")
+    def api_task_attachment_file(team_gid, project_gid, task_gid, filename):
+        try:
+            team_dir = _team_dir_or_404(team_gid)
+        except LookupError as exc:
+            return error_response(exc, 404)
+        workspace_dir = state.paths.workspace_dir_of_team(team_dir)
+        task_dir = state.paths.task_dir(workspace_dir, task_gid)
+        return send_from_directory(task_dir / "attachments", filename)
 
     return app

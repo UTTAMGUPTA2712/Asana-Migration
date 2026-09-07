@@ -183,7 +183,7 @@ async function loadProjects() {
     const tile = document.createElement("div");
     tile.className = "tile";
     tile.innerHTML = `
-      <div class="row"><h3>${escapeHtml(p.name)}</h3>${statusBadge(p)}</div>
+      <div class="row"><h3>${escapeHtml(p.name)}${p.archived ? ' <span class="tag">archived</span>' : ""}</h3>${statusBadge(p)}</div>
       <div class="sub">${meta.sections_total ?? "?"} sections · ${done}/${total || "?"} tasks · ${meta.comments_imported || 0} tasks' comments fetched</div>
       <div class="progress ${p.status === "not_imported" ? "hidden" : ""}"><div style="width:${pct}%"></div></div>
       <div class="row" style="margin-top:10px;">
@@ -291,6 +291,7 @@ function renderTasks(tasks) {
         <span class="name">${escapeHtml(t.name)}</span>
         ${t.assignee ? `<span class="tag">${escapeHtml(t.assignee)}</span>` : ""}
         ${t.comments_count ? `<span class="tag">💬 ${t.comments_count}</span>` : ""}
+        ${t.attachments_count ? `<span class="tag">📎 ${t.attachments_count}</span>` : ""}
         ${t.num_subtasks ? `<span class="tag">${t.subtasks.length}/${t.num_subtasks} subtasks</span>` : ""}
       </div>
       ${t.subtasks && t.subtasks.length ? renderTasks(t.subtasks) : ""}
@@ -320,12 +321,20 @@ async function openTaskModal(taskGid, name) {
         <div class="meta">${escapeHtml((c.created_by || {}).name || "Unknown")} · ${escapeHtml(c.created_at || "")}</div>
         <div>${escapeHtml(c.text || "")}</div>
       </div>`).join("") || `<p class="muted">No comments.</p>`;
+    const attachments = (data.attachments || []).map((a) => {
+      const label = escapeHtml(a.name || a.gid) + (a.host !== "asana" ? ` (${escapeHtml(a.host)}, link only)` : "");
+      const href = a.local_path
+        ? `/api/teams/${state.team.gid}/projects/${state.project.gid}/tasks/${taskGid}/attachments/${encodeURIComponent(a.local_path.split("/").pop())}`
+        : (a.view_url || a.permanent_url || a.download_url || "#");
+      return `<div class="comment"><a href="${href}" target="_blank" rel="noopener">📎 ${label}</a>${a.download_error ? `<div class="meta">download failed: ${escapeHtml(a.download_error)}</div>` : ""}</div>`;
+    }).join("") || `<p class="muted">No attachments.</p>`;
     $("taskModalBody").innerHTML = `
       <h3>${escapeHtml(t.name)}</h3>
       <p class="muted">${t.completed ? "✅ Completed" : "Open"} ${t.due_on ? "· due " + escapeHtml(t.due_on) : ""}
         ${t.assignee ? "· assignee " + escapeHtml(t.assignee.name) : ""}</p>
       <p>${escapeHtml(t.notes || "").replace(/\n/g, "<br>") || '<span class="muted">No description.</span>'}</p>
       <div class="section-block"><h4>Collaborators</h4><div class="chip-list">${collaborators}</div></div>
+      <div class="section-block"><h4>Attachments</h4>${attachments}</div>
       <div class="section-block"><h4>Comments</h4>${comments}</div>
     `;
   } catch (err) {

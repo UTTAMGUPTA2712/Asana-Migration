@@ -1,27 +1,41 @@
 """On-disk layout for the exported Asana data.
 
-The folder tree mirrors Asana's own hierarchy so it reads naturally with a
-plain file browser::
+Asana lets both a **project** belong to more than one team, and a **task**
+be simultaneously a subtask of one task and a top-level member of another
+project — so "which team owns this project" and "which project/parent owns
+this task" aren't 1:1. To avoid fetching (and duplicating on disk) the same
+project or task once per team/parent that references it, both live in a
+single shared pool per workspace, addressed only by gid; teams and projects
+just hold lightweight indexes pointing into those pools::
 
     data/
       <workspace_gid>_<slug>/
         workspace.json
+        projects/                        # every project, fetched once
+          <project_gid>_<slug>/
+            project.json    # project fields
+            members.json    # project members (full list)
+            sections.json   # ordered list of sections
+            _meta.json      # import progress/status for this project
+            _index.json     # this project's task tree: gid -> {depth, parent,
+                             #   section, ...} - the actual task content lives
+                             #   in tasks/ below, referenced by gid
+        tasks/                            # every task/subtask, fetched once
+          <task_gid>_<slug>/
+            task.json
+            comments.json       # stories of type "comment"
+            collaborators.json  # followers, resolved
+            attachments.json    # attachment metadata (all hosts)
+            attachments/        # downloaded file bytes, Asana-hosted only -
+                                 #   externally-hosted (Dropbox/Drive/Box/...)
+                                 #   attachments are link-only in attachments.json
         teams/
           <team_gid>_<slug>/
             team.json
-            projects/
-              <project_gid>_<slug>/
-                project.json        # project fields
-                members.json        # project members (full list)
-                sections.json       # ordered list of sections
-                _meta.json          # import progress/status for this project
-                tasks/
-                  <task_gid>_<slug>/
-                    task.json
-                    comments.json       # stories of type "comment"
-                    collaborators.json  # followers, resolved
-                    subtasks/
-                      <subtask_gid>_<slug>/   # same shape, recursively
+            projects_index.json   # [{gid, name, archived, ...}, ...] from
+                                   # GET /teams/{gid}/projects - a pointer
+                                   # list into data/<workspace>/projects/,
+                                   # not a copy of the project data itself
 
 Every directory that represents an importable "thing" also gets a
 ``_meta.json`` recording status/progress/timestamps, which is what the web UI
@@ -32,7 +46,9 @@ calling Asana itself.
 from __future__ import annotations
 
 import json
+import os
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -61,10 +77,32 @@ def read_json(path: Path, default=None):
         return default
 
 
+def _unique_tmp_path(path: Path) -> Path:
+    """A temp-file name nobody else's writer could also be using right now.
+
+    Two processes (or two threads) writing the *same* target path at the
+    same time used to both write through the identical `file.json.tmp` name;
+    whichever called os.replace() first would silently consume the other's
+    temp file out from under it, crashing the loser with FileNotFoundError.
+    Including the pid, thread id and a nanosecond timestamp makes collision
+    practically impossible - each writer gets its own temp file, and the
+    last replace() to run simply wins (as intended), instead of one writer
+    finding its temp file already gone.
+    """
+    return path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp")
+
+
 def write_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = _unique_tmp_path(path)
     tmp.write_text(json.dumps(data, indent=2, sort_keys=False))
+    tmp.replace(path)
+
+
+def write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _unique_tmp_path(path)
+    tmp.write_bytes(data)
     tmp.replace(path)
 
 
@@ -100,10 +138,13 @@ class Meta:
 
 
 class TaskIndex:
-    """Flat gid -> summary map for every task/subtask imported under a project.
+    """Flat gid -> summary map of every task/subtask in one project's tree.
 
-    Lets the web UI render the whole task tree of a project from one small
-    file instead of walking (and reading) every task.json on disk.
+    Lets the web UI render a project's whole task tree from one small file
+    instead of walking (and reading) every task.json on disk. The actual
+    task content lives in the workspace's shared `tasks/` pool (see
+    `Paths.task_dir`) - this only records how that gid fits into *this*
+    project's hierarchy (depth, parent, section).
     """
 
     def __init__(self, project_dir: Path):
@@ -121,7 +162,14 @@ class TaskIndex:
 
 
 class Paths:
-    """Resolves directory paths for every level of the hierarchy."""
+    """Resolves directory paths for every level of the hierarchy.
+
+    `project_dir` and `task_dir` are keyed by gid under a shared per-workspace
+    pool (see module docstring): calling them again for a gid that already
+    has a directory returns that same directory rather than minting a new
+    one, which is what lets a project/task shared across teams or parents
+    be stored - and fetched from Asana - exactly once.
+    """
 
     def __init__(self, root: Path = DATA_DIR):
         self.root = root
@@ -135,14 +183,20 @@ class Paths:
         existing = self._find_existing(base, team_gid)
         return existing or gid_dir(base, team_gid, name)
 
-    def project_dir(self, team_dir: Path, project_gid: str, name: str | None = None) -> Path:
-        base = team_dir / "projects"
+    def project_dir(self, workspace_dir: Path, project_gid: str, name: str | None = None) -> Path:
+        base = workspace_dir / "projects"
         existing = self._find_existing(base, project_gid)
         return existing or gid_dir(base, project_gid, name)
 
-    def task_dir(self, parent_tasks_dir: Path, task_gid: str, name: str | None = None) -> Path:
-        existing = self._find_existing(parent_tasks_dir, task_gid)
-        return existing or gid_dir(parent_tasks_dir, task_gid, name)
+    def task_dir(self, workspace_dir: Path, task_gid: str, name: str | None = None) -> Path:
+        base = workspace_dir / "tasks"
+        existing = self._find_existing(base, task_gid)
+        return existing or gid_dir(base, task_gid, name)
+
+    @staticmethod
+    def workspace_dir_of_team(team_dir: Path) -> Path:
+        """team_dir is always <workspace_dir>/teams/<team>; undo that."""
+        return team_dir.parent.parent
 
     @staticmethod
     def _find_existing(base: Path, gid: str) -> Path | None:
@@ -174,11 +228,7 @@ class Paths:
         for ws in self.root.iterdir():
             if not ws.is_dir():
                 continue
-            teams_dir = ws / "teams"
-            if not teams_dir.exists():
-                continue
-            for team in teams_dir.iterdir():
-                found = self._find_existing(team / "projects", project_gid)
-                if found:
-                    return found
+            found = self._find_existing(ws / "projects", project_gid)
+            if found:
+                return found
         return None

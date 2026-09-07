@@ -62,6 +62,7 @@ def _cmd_import_all(args: argparse.Namespace) -> None:
     from .importer import (
         HANDLERS,
         ImporterContext,
+        ensure_other_projects_index,
         ensure_team_projects_index,
         import_workspaces_and_teams,
         project_view,
@@ -102,15 +103,24 @@ def _cmd_import_all(args: argparse.Namespace) -> None:
     discovered = import_workspaces_and_teams(ctx)
 
     considered: list[tuple[Path, str, str]] = []  # (project_dir, project_gid, project_name)
+    seen_project_gids: set[str] = set()  # a project can belong to more than one team
     total_projects = 0
     queued_projects = 0
     for ws in discovered:
+        workspace_dir = Path(ws["dir"])
+        real_teams = [(t["gid"], Path(t["dir"])) for t in ws["teams"] if not t.get("is_virtual")]
         for team in ws["teams"]:
             team_dir = Path(team["dir"])
-            projects = ensure_team_projects_index(ctx, team_dir, team["gid"], force=args.force)
+            if team.get("is_virtual"):
+                projects = ensure_other_projects_index(ctx, team_dir, ws["workspace"]["gid"], real_teams, force=args.force)
+            else:
+                projects = ensure_team_projects_index(ctx, team_dir, team["gid"], force=args.force)
             for p in projects:
+                if p["gid"] in seen_project_gids:
+                    continue
+                seen_project_gids.add(p["gid"])
                 total_projects += 1
-                project_dir = paths.project_dir(team_dir, p["gid"], p.get("name"))
+                project_dir = paths.project_dir(workspace_dir, p["gid"], p.get("name"))
                 considered.append((project_dir, p["gid"], p.get("name")))
                 meta = Meta(project_dir).read()
                 if not args.force and meta.get("status") == "complete":
@@ -121,6 +131,7 @@ def _cmd_import_all(args: argparse.Namespace) -> None:
                     "import_project",
                     {"team_dir": str(team_dir), "project_gid": p["gid"]},
                     dedupe_key=f"project:{p['gid']}",
+                    force=args.force,
                 )
                 if job:
                     queued_projects += 1
@@ -150,7 +161,10 @@ def _cmd_import_all(args: argparse.Namespace) -> None:
             processed += 1
         except Exception as exc:  # noqa: BLE001 - keep the run alive; queue.fail() handles retry/backoff
             log.warning("job #%d (%s) failed: %s", job.id, job.type, exc)
-            queue.fail(job.id, str(exc))
+            try:
+                queue.fail(job.id, str(exc))
+            except Exception as record_exc:  # noqa: BLE001 - never let recording a failure crash the run
+                log.warning("job #%d: also failed to record that failure: %s", job.id, record_exc)
 
         now = time.monotonic()
         if now - last_report >= 15:

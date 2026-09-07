@@ -36,8 +36,6 @@ class AsanaClient:
         self.session = requests.Session()
         self.session.headers.update({"Authorization": f"Bearer {token}"})
 
-    # -- low level -----------------------------------------------------
-
     def _request(self, method: str, path: str, params: dict | None = None, max_retries: int = 6) -> dict:
         url = path if path.startswith("http") else f"{BASE_URL}{path}"
         attempt = 0
@@ -105,8 +103,6 @@ class AsanaClient:
             offset = next_page["offset"]
             page_num += 1
 
-    # -- high level, one Asana object type each -------------------------
-
     def get_me(self) -> dict:
         return self.get("/users/me", {"opt_fields": "gid,name,email"})["data"]
 
@@ -123,9 +119,22 @@ class AsanaClient:
         return self.get(f"/teams/{team_gid}", {"opt_fields": "gid,name,description,organization.name"})["data"]
 
     def get_projects_for_team(self, team_gid: str) -> Iterable[dict]:
+        # No `archived` filter: this is a full export, so archived projects
+        # are included too (each result carries its own `archived` field so
+        # callers/UI can still tell them apart).
         yield from self.paginate(
             f"/teams/{team_gid}/projects",
-            {"opt_fields": "gid,name,archived,created_at,modified_at", "archived": "false"},
+            {"opt_fields": "gid,name,archived,created_at,modified_at"},
+        )
+
+    def get_projects_for_workspace(self, workspace_gid: str) -> Iterable[dict]:
+        """Every project you can see in the workspace, independent of team
+        membership - catches projects that are visible to you (org-public,
+        or you were added individually) whose home team you don't belong to,
+        which /teams/{gid}/projects would never surface."""
+        yield from self.paginate(
+            f"/workspaces/{workspace_gid}/projects",
+            {"opt_fields": "gid,name,archived,created_at,modified_at"},
         )
 
     def get_project(self, project_gid: str) -> dict:
@@ -172,3 +181,18 @@ class AsanaClient:
     def get_stories_for_task(self, task_gid: str) -> Iterable[dict]:
         fields = "gid,type,resource_subtype,text,html_text,created_at,created_by.gid,created_by.name,created_by.email"
         yield from self.paginate(f"/tasks/{task_gid}/stories", {"opt_fields": fields})
+
+    def get_attachments_for_task(self, task_gid: str) -> Iterable[dict]:
+        fields = "gid,name,host,download_url,view_url,permanent_url,size,resource_subtype,created_at"
+        yield from self.paginate(f"/tasks/{task_gid}/attachments", {"opt_fields": fields})
+
+    def download_file(self, url: str) -> bytes:
+        """Fetch raw bytes from an attachment's (short-lived, pre-signed)
+        download_url. This isn't an api.asana.com call - it doesn't carry our
+        bearer token and doesn't count against Asana's API rate limit - but
+        it's still paced through the same limiter so a task with many
+        attachments doesn't burst a pile of downloads at once."""
+        self.rate_limiter.acquire()
+        resp = requests.get(url, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.content

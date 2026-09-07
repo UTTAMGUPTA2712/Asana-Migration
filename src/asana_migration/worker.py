@@ -1,10 +1,11 @@
 """The background worker: pops one job at a time and runs it.
 
-Deliberately single-threaded. The `RateLimiter` already caps how many
-requests per minute leave the process, so a single worker draining the queue
-serially gives predictable, easy-to-reason-about pacing ("slowly, one thing
-at a time") and avoids any need to lock the on-disk JSON tree against
-concurrent writers.
+Deliberately single-threaded within this process. The `RateLimiter` already
+caps how many requests per minute leave the process, so a single worker
+draining the queue serially gives predictable, easy-to-reason-about pacing
+("slowly, one thing at a time"). `JobQueue` itself is safe to share with
+another process (e.g. a standalone `import-all` run) via cross-process file
+locking - see jobs.py.
 """
 
 from __future__ import annotations
@@ -40,18 +41,26 @@ class Worker:
         queue: JobQueue = self.ctx.queue
         log.info("import worker started")
         while not self._stop.is_set():
-            job = queue.pop_next()
-            if job is None:
-                time.sleep(self.poll_interval)
-                continue
-            handler = HANDLERS.get(job.type)
-            if handler is None:
-                queue.fail(job.id, f"no handler registered for job type {job.type!r}")
-                continue
-            log.debug("job #%d: %s %s", job.id, job.type, job.payload)
+            # This whole body is guarded: it's a daemon thread, so any
+            # exception that escapes it dies silently and the worker just
+            # stops forever with no visible crash. Nothing here should ever
+            # be allowed to do that.
             try:
-                handler(self.ctx, job.payload)
-                queue.complete(job.id)
-            except Exception as exc:  # noqa: BLE001 - job errors must not kill the worker
-                log.warning("job %s (%s) failed: %s", job.id, job.type, exc)
-                queue.fail(job.id, str(exc))
+                job = queue.pop_next()
+                if job is None:
+                    time.sleep(self.poll_interval)
+                    continue
+                handler = HANDLERS.get(job.type)
+                if handler is None:
+                    queue.fail(job.id, f"no handler registered for job type {job.type!r}")
+                    continue
+                log.debug("job #%d: %s %s", job.id, job.type, job.payload)
+                try:
+                    handler(self.ctx, job.payload)
+                    queue.complete(job.id)
+                except Exception as exc:  # noqa: BLE001 - job errors must not kill the worker
+                    log.warning("job %s (%s) failed: %s", job.id, job.type, exc)
+                    queue.fail(job.id, str(exc))
+            except Exception as exc:  # noqa: BLE001 - last-resort guard, see comment above
+                log.error("import worker hit an unexpected error, will keep going: %s", exc)
+                time.sleep(self.poll_interval)

@@ -1,4 +1,4 @@
-# asana-migration
+# Asana Migration
 
 Exports an Asana account — teams, projects, sections, tasks, subtasks (nested,
 any depth), comments, and collaborators — to a local, browsable JSON folder
@@ -10,29 +10,83 @@ worker drains one request at a time, paced by a token-bucket rate limiter. If
 you stop the server and start it again later, the queue and all previously
 imported data are exactly where you left them.
 
-A local web UI walks you through it:
+A local web UI walks you through it, or you can run the entire thing
+unattended from the terminal with one command (`import-all`, below).
 
-1. Paste an Asana **personal access token**.
-2. **Import teams** — a couple of cheap calls list your workspaces/teams.
-3. Open a team → its projects load from local cache instantly if you've
-   fetched them before; otherwise one lightweight call lists them.
-4. **Import** a project (or **import all** for the team) — this queues the
-   deep crawl (sections → tasks → subtasks → comments → collaborators) and
-   runs it in the background. Progress ("12/40 tasks imported") updates live
-   and is always visible per project, so it's clear what's been imported and
-   what hasn't.
+## Getting started
 
-## Run it
+### 1. Prerequisites
+
+- [`uv`](https://docs.astral.sh/uv/) installed. Python itself is pinned by
+  `.python-version` (3.13) and `uv` will fetch it for you — nothing else to
+  install.
+
+### 2. Get an Asana personal access token
+
+1. In Asana, click your profile photo (top right) → **My Settings**.
+2. Go to the **Apps** tab → **Manage Developer Apps**.
+3. Under **Personal Access Tokens**, click **Create New Token**, give it a
+   name (e.g. "local export"), and copy it — Asana only shows it once.
+
+This token acts as *you*: the export will only see teams/projects you
+personally have access to.
+
+### 3. Install and launch
 
 ```bash
 uv sync
 uv run asana-migration serve
 ```
 
-This opens `http://127.0.0.1:5050`. Use `--port`, `--host`, `--no-browser` to
-customize.
+This opens `http://127.0.0.1:5050` in your browser (use `--port`, `--host`,
+`--no-browser` to customize).
 
-### Or: run the whole export in one go, from the terminal
+### 4. Walk through the UI
+
+1. **Paste the token** from step 2 and click **Connect**. It's checked
+   against Asana immediately, then saved to `var/config.json` on your machine.
+2. Click **Import teams** — a couple of cheap calls list your workspaces and
+   teams and cache them locally. This is instant.
+3. **Click a team.** Its projects load from local cache instantly if you've
+   fetched them before; otherwise one lightweight call lists them, each
+   tagged "not imported" / "importing…" / "imported".
+4. Click **Import** on a project (or **Import all projects** for the whole
+   team). This queues the deep crawl — sections → tasks → subtasks →
+   comments → collaborators — and runs it in the background, paced by the
+   rate limiter. The card updates live ("12/40 tasks imported") until it
+   flips to "imported ✓"; you can navigate away and come back, or close the
+   tab and reopen it later — nothing is lost.
+5. Click into an **imported project** to see its section/task tree; click
+   any task to see its notes, assignee, collaborators, and comments in a
+   side panel.
+6. Open **⚙ Settings** (top right) to change the requests/minute rate limit,
+   or to swap in a different token.
+
+Once something is marked "imported", every screen showing it loads from the
+local `data/` folder — no more Asana calls until you explicitly re-import.
+
+### 5. Find your data
+
+Everything lands under `./data` as plain JSON files you can grep, script
+against, or hand to another tool — see **Where things live** below for the
+exact layout.
+
+### Troubleshooting
+
+- **"Asana rejected the personal access token (401)"** — the token is wrong,
+  revoked, or expired; generate a new one (step 2) and reconnect via
+  Settings → *Change token*.
+- **A project is stuck on "importing…"** — it isn't stuck, it's throttled;
+  check the queue badge in the header (top right) for how many requests are
+  still pending. A large project can legitimately take a while at the
+  default 100 req/min.
+- **Jobs show as "failed"** — each job retries automatically (with backoff)
+  up to 5 times before giving up; re-opening the project or re-running
+  `import-all` retries only what's left.
+- **Start over completely** — stop the server and `rm -rf var data`, then
+  relaunch and reconnect.
+
+## Or: run the whole export in one go, from the terminal
 
 ```bash
 uv run asana-migration import-all
@@ -79,12 +133,25 @@ it left off, not from page 1.
 - `data/` — the exported tree:
 
   ```
-  data/<workspace>/teams/<team>/projects/<project>/
-    project.json  members.json  sections.json  _meta.json  _index.json
-    tasks/<task>/
+  data/<workspace>/
+    workspace.json
+    projects/<project>/            # every project, fetched once
+      project.json  members.json  sections.json  _meta.json  _index.json
+    tasks/<task>/                  # every task/subtask, fetched once
       task.json  comments.json  collaborators.json
-      subtasks/<subtask>/        # same shape, recursively
+    teams/<team>/
+      team.json
+      projects_index.json          # which project gids belong to this team
   ```
+
+  A project can belong to more than one Asana team, and a task can be a
+  subtask of one task while also directly belonging to another project - so
+  projects and tasks are pooled once per workspace, addressed by gid, rather
+  than copied into every team/project/parent that references them. A team's
+  `projects_index.json` and a project's `_index.json` are just pointer
+  lists into those pools; the same project or task gid can legitimately
+  appear in more than one of them without being fetched from Asana or
+  written to disk more than once.
 
   `_meta.json` is the per-project import status/progress the UI reads.
   `_index.json` is a flat gid → summary map used to render the task tree
