@@ -2,17 +2,9 @@ services:
   asana-migration:
     build: .
     ports:
-      # `serve` auto-starts (see Dockerfile CMD)
       - "5050:5050"
     volumes:
-      # data/var: bind mounts, not Docker volumes - land directly in these
-      # folders on your machine, browsable with a normal file manager, and
-      # survive `docker compose down` / an image rebuild.
       - ./data:/app/data
       - ./var:/app/var
-      # src/: bind-mounted too, so local edits take effect immediately in
-      # the running container (it's an editable install) without a rebuild -
-      # only pyproject.toml/uv.lock changes (new deps, new console scripts)
-      # need `docker compose up -d --build`.
       - ./src:/app/src
     restart: unless-stopped

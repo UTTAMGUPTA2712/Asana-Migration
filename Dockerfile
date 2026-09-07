@@ -18,6 +18,8 @@ ENV PATH="/app/.venv/bin:${PATH}"
 
 EXPOSE 5050
 
-# if dont need to directly run the serve command
+# if need manual control on the service running
 # CMD ["sleep", "infinity"]
+
+# directly runs the serve
 CMD ["serve", "--no-browser"]
