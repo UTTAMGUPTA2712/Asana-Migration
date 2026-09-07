@@ -322,11 +322,10 @@ async function openTaskModal(taskGid, name) {
         <div>${escapeHtml(c.text || "")}</div>
       </div>`).join("") || `<p class="muted">No comments.</p>`;
     const attachments = (data.attachments || []).map((a) => {
-      const label = escapeHtml(a.name || a.gid) + (a.host !== "asana" ? ` (${escapeHtml(a.host)}, link only)` : "");
-      const href = a.local_path
-        ? `/api/teams/${state.team.gid}/projects/${state.project.gid}/tasks/${taskGid}/attachments/${encodeURIComponent(a.local_path.split("/").pop())}`
-        : (a.view_url || a.permanent_url || a.download_url || "#");
-      return `<div class="comment"><a href="${href}" target="_blank" rel="noopener">📎 ${label}</a>${a.download_error ? `<div class="meta">download failed: ${escapeHtml(a.download_error)}</div>` : ""}</div>`;
+      // Metadata + link only, nothing is downloaded - see importer.py.
+      const label = escapeHtml(a.name || a.gid) + ` (${escapeHtml(a.host)})`;
+      const href = a.view_url || a.permanent_url || a.download_url || "#";
+      return `<div class="comment"><a href="${href}" target="_blank" rel="noopener">📎 ${label}</a></div>`;
     }).join("") || `<p class="muted">No attachments.</p>`;
     $("taskModalBody").innerHTML = `
       <h3>${escapeHtml(t.name)}</h3>

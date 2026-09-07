@@ -25,10 +25,9 @@ just hold lightweight indexes pointing into those pools::
             task.json
             comments.json       # stories of type "comment"
             collaborators.json  # followers, resolved
-            attachments.json    # attachment metadata (all hosts)
-            attachments/        # downloaded file bytes, Asana-hosted only -
-                                 #   externally-hosted (Dropbox/Drive/Box/...)
-                                 #   attachments are link-only in attachments.json
+            attachments.json    # attachment metadata + links (all hosts) -
+                                 #   never downloaded, view_url/permanent_url/
+                                 #   download_url only (the last expires fast)
         teams/
           <team_gid>_<slug>/
             team.json

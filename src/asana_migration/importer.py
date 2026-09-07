@@ -25,7 +25,7 @@ from pathlib import Path
 
 from .client import AsanaClient
 from .jobs import JobQueue
-from .storage import Meta, Paths, TaskIndex, now_iso, read_json, slugify, write_bytes, write_json
+from .storage import Meta, Paths, TaskIndex, now_iso, read_json, write_json
 
 log = logging.getLogger("asana_migration.importer")
 
@@ -343,6 +343,11 @@ def h_import_task_comments(ctx: ImporterContext, payload: dict) -> None:
 
 
 def h_import_task_attachments(ctx: ImporterContext, payload: dict) -> None:
+    """Metadata + links only - never downloads the file. `download_url` is a
+    short-lived signed URL (expires quickly), so it's saved for convenience
+    but don't rely on it later; `permanent_url` is the durable reference, and
+    re-fetching `GET /attachments/{gid}` at download time gets a fresh
+    `download_url` when one is actually needed."""
     workspace_dir = Path(payload["workspace_dir"])
     project_dir = Path(payload["project_dir"])
     task_gid = payload["task_gid"]
@@ -350,32 +355,9 @@ def h_import_task_attachments(ctx: ImporterContext, payload: dict) -> None:
     log.info("Task %s: fetching attachments...", task_gid)
     attachments = list(ctx.client.get_attachments_for_task(task_gid))
 
-    downloaded = 0
-    for att in attachments:
-        if att.get("host") != "asana" or not att.get("download_url"):
-            # Dropbox/Google Drive/Box/OneDrive/external - just a link to
-            # another service, nothing we can pull down via Asana itself.
-            att["local_path"] = None
-            continue
-        original = Path(att.get("name") or "file")
-        safe_stem = slugify(original.stem, fallback=att["gid"])
-        file_name = f"{att['gid']}_{safe_stem}{original.suffix}"
-        try:
-            content = ctx.client.download_file(att["download_url"])
-            write_bytes(task_dir / "attachments" / file_name, content)
-            att["local_path"] = f"attachments/{file_name}"
-            downloaded += 1
-        except Exception as exc:  # noqa: BLE001 - a download_url can expire; don't fail the whole job over it
-            log.warning("Task %s: failed to download attachment '%s': %s", task_gid, att.get("name"), exc)
-            att["local_path"] = None
-            att["download_error"] = str(exc)[:300]
-
     write_json(task_dir / "attachments.json", attachments)
     TaskIndex(project_dir).update_entry(task_gid, attachments_count=len(attachments))
-    log.info(
-        "Task %s: saved %d attachment(s) (%d downloaded, %d link-only/external)",
-        task_gid, len(attachments), downloaded, len(attachments) - downloaded,
-    )
+    log.info("Task %s: saved %d attachment link(s) (no download)", task_gid, len(attachments))
 
 
 def h_import_subtasks(ctx: ImporterContext, payload: dict) -> None:
