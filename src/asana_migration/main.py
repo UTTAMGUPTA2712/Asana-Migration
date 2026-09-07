@@ -77,7 +77,6 @@ def _cmd_import_all(args: argparse.Namespace) -> None:
     from . import config as config_mod
     from .client import AsanaAuthError, AsanaClient
     from .importer import (
-        HANDLERS,
         ImporterContext,
         ensure_other_projects_index,
         ensure_team_members,
@@ -87,6 +86,7 @@ def _cmd_import_all(args: argparse.Namespace) -> None:
     )
     from .jobs import JobQueue
     from .rate_limiter import RateLimiter
+    from .worker import RPM_PER_WORKER, WorkerPool, desired_worker_count
     from .storage import Meta, Paths
 
     cfg = config_mod.load_config()
@@ -177,39 +177,32 @@ def _cmd_import_all(args: argparse.Namespace) -> None:
         len(discovered), total_projects, queued_projects,
     )
 
-    log.info("=== Step 2/2: draining the import queue (this is the slow, rate-limited part) ===")
+    num_workers = desired_worker_count(cfg.rate_limit_per_minute)
+    log.info(
+        "=== Step 2/2: draining the import queue with %d worker(s) (~%d req/min each) - "
+        "this is the slow, rate-limited part ===",
+        num_workers, RPM_PER_WORKER,
+    )
     start = time.monotonic()
-    processed = 0
+    done_at_start = queue.stats()["done"]
+    pool = WorkerPool(ctx)
+    pool.start(cfg.rate_limit_per_minute)
     last_report = start
-    while True:
-        stats = queue.stats()
-        if stats["queued"] == 0 and stats["running"] == 0:
-            break
-        job = queue.pop_next()
-        if job is None:
-            # Nothing ready right now (jobs are waiting out a retry backoff) - wait a bit.
-            time.sleep(1)
-            continue
-        handler = HANDLERS.get(job.type)
-        try:
-            handler(ctx, job.payload)
-            queue.complete(job.id)
-            processed += 1
-        except Exception as exc:  # noqa: BLE001 - keep the run alive; queue.fail() handles retry/backoff
-            log.warning("job #%d (%s) failed: %s", job.id, job.type, exc)
-            try:
-                queue.fail(job.id, str(exc))
-            except Exception as record_exc:  # noqa: BLE001 - never let recording a failure crash the run
-                log.warning("job #%d: also failed to record that failure: %s", job.id, record_exc)
-
-        now = time.monotonic()
-        if now - last_report >= 15:
+    try:
+        while True:
             stats = queue.stats()
-            log.info(
-                "Progress: %d job(s) completed so far | queue: %d queued, %d running, %d failed permanently",
-                processed, stats["queued"], stats["running"], stats["error"],
-            )
-            last_report = now
+            if stats["queued"] == 0 and stats["running"] == 0:
+                break
+            now = time.monotonic()
+            if now - last_report >= 15:
+                log.info(
+                    "Progress: %d job(s) completed so far | queue: %d queued, %d running, %d failed permanently",
+                    stats["done"] - done_at_start, stats["queued"], stats["running"], stats["error"],
+                )
+                last_report = now
+            time.sleep(1)
+    finally:
+        pool.stop()
 
     elapsed = time.monotonic() - start
     stats = queue.stats()

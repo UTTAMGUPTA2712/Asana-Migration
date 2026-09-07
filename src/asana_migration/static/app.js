@@ -70,8 +70,9 @@ setInterval(async () => {
 function updateQueueBadge(q) {
   const active = q.queued + q.running;
   const badge = $("queueBadge");
+  const workers = q.workers ? ` · ${q.workers} worker${q.workers === 1 ? "" : "s"}` : "";
   badge.textContent = active
-    ? `⏳ ${active} pending (${q.running} running)` + (q.error ? `, ${q.error} failed` : "")
+    ? `⏳ ${active} pending (${q.running} running)${workers}` + (q.error ? `, ${q.error} failed` : "")
     : (q.error ? `${q.error} failed jobs` : "idle");
   badge.classList.toggle("active", active > 0);
 }

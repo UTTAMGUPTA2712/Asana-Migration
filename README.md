@@ -203,3 +203,14 @@ Every Asana call goes through one shared token-bucket limiter (default 100
 requests/minute — adjustable in the UI's Settings panel). A `429` response
 pauses *all* in-flight work for the `Retry-After` duration Asana asks for,
 not just the request that got throttled.
+
+A single worker is bound by request round-trip latency (network + disk +
+queue-lock overhead), not by the limiter itself - in practice, one worker
+tops out around 50-90 completed jobs/minute regardless of how high the
+configured limit is, since it only ever has one request in flight. Raising
+the rate limit doesn't raise that ceiling on its own; running more requests
+concurrently does. So the import is driven by a **pool of workers**, sized
+to the configured rate limit at roughly one worker per 75 requests/minute
+(e.g. 150 → 2 workers, 2000 → 27) - it resizes live when you change the
+rate limit in Settings, no restart needed, and `import-all` sizes its pool
+once at startup from whatever rate limit you confirm.

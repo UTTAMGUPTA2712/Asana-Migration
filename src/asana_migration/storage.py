@@ -52,6 +52,7 @@ calling Asana itself.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -61,7 +62,35 @@ from pathlib import Path
 
 from .config import DATA_DIR
 
+try:
+    import fcntl
+    _HAVE_FLOCK = True
+except ImportError:  # pragma: no cover - non-POSIX platform
+    _HAVE_FLOCK = False
+
 _slug_re = re.compile(r"[^a-z0-9]+")
+
+
+@contextlib.contextmanager
+def _locked(path: Path):
+    """Cross-thread/cross-process exclusive lock for a read-modify-write
+    cycle on `path`, via a sibling `.lock` file. Needed for anything more
+    than one worker thread/process updates concurrently - `Meta`'s
+    per-project counters and `TaskIndex`'s per-project map are both shared
+    by every task in that project regardless of which worker processes it,
+    so without this, concurrent increments/updates silently lose writes
+    (last read-modify-write cycle to finish wins, the rest are clobbered)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not _HAVE_FLOCK:
+        yield
+        return
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with open(lock_path, "a+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def slugify(name: str | None, fallback: str = "untitled") -> str:
@@ -127,21 +156,23 @@ class Meta:
         return read_json(self.path, default={}) or {}
 
     def update(self, **fields) -> dict:
-        data = self.read()
-        data.update(fields)
-        data["updated_at"] = now_iso()
-        write_json(self.path, data)
-        return data
+        with _locked(self.path):
+            data = self.read()
+            data.update(fields)
+            data["updated_at"] = now_iso()
+            write_json(self.path, data)
+            return data
 
     def set_status(self, status: str, **extra) -> dict:
         return self.update(status=status, **extra)
 
     def increment(self, field: str, amount: int = 1) -> dict:
-        data = self.read()
-        data[field] = data.get(field, 0) + amount
-        data["updated_at"] = now_iso()
-        write_json(self.path, data)
-        return data
+        with _locked(self.path):
+            data = self.read()
+            data[field] = data.get(field, 0) + amount
+            data["updated_at"] = now_iso()
+            write_json(self.path, data)
+            return data
 
 
 class TaskIndex:
@@ -161,11 +192,12 @@ class TaskIndex:
         return read_json(self.path, default={}) or {}
 
     def update_entry(self, task_gid: str, **fields) -> None:
-        data = self.read()
-        entry = data.get(task_gid, {"gid": task_gid})
-        entry.update(fields)
-        data[task_gid] = entry
-        write_json(self.path, data)
+        with _locked(self.path):
+            data = self.read()
+            entry = data.get(task_gid, {"gid": task_gid})
+            entry.update(fields)
+            data[task_gid] = entry
+            write_json(self.path, data)
 
 
 class Paths:

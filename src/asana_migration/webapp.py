@@ -30,7 +30,7 @@ from .importer import (
 from .jobs import JobQueue
 from .rate_limiter import RateLimiter
 from .storage import Paths, TaskIndex, read_json
-from .worker import Worker
+from .worker import WorkerPool
 
 log = logging.getLogger("asana_migration.webapp")
 STATIC_DIR = Path(__file__).parent / "static"
@@ -46,7 +46,7 @@ class AppState:
         self.rate_limiter = RateLimiter(self.cfg.rate_limit_per_minute)
         self.client: AsanaClient | None = None
         self.ctx: ImporterContext | None = None
-        self.worker: Worker | None = None
+        self.worker_pool: WorkerPool | None = None
         if self.cfg.has_token:
             self._build_client()
 
@@ -58,8 +58,8 @@ class AppState:
             queue=self.queue,
             max_subtask_depth=self.cfg.max_subtask_depth,
         )
-        self.worker = Worker(self.ctx)
-        self.worker.start()
+        self.worker_pool = WorkerPool(self.ctx)
+        self.worker_pool.start(self.cfg.rate_limit_per_minute)
 
     def set_token(self, token: str) -> None:
         self.cfg = config_mod.set_token(token)
@@ -69,6 +69,8 @@ class AppState:
         self.cfg.rate_limit_per_minute = rpm
         config_mod.save_config(self.cfg)
         self.rate_limiter.set_rate(rpm)
+        if self.worker_pool:
+            self.worker_pool.resize(rpm)
 
     def require_client(self):
         if not self.client:
@@ -113,6 +115,7 @@ def create_app() -> Flask:
             "rate_limit_per_minute": state.cfg.rate_limit_per_minute,
             "max_subtask_depth": state.cfg.max_subtask_depth,
             "queue": state.queue.stats(),
+            "workers": state.worker_pool.worker_count() if state.worker_pool else 0,
         })
 
     @app.post("/api/token")
@@ -136,7 +139,10 @@ def create_app() -> Flask:
 
     @app.get("/api/jobs")
     def api_jobs():
-        return jsonify(state.queue.stats())
+        return jsonify({
+            **state.queue.stats(),
+            "workers": state.worker_pool.worker_count() if state.worker_pool else 0,
+        })
 
     @app.post("/api/import-teams")
     def api_import_teams():
