@@ -101,11 +101,20 @@ class WorkerPool:
         self._workers: list[_WorkerThread] = []
         self._next_id = 1
 
-    def start(self, rate_limit_per_minute: int) -> None:
+    def start(self, rate_limit_per_minute: int | None = None, *, worker_count: int | None = None) -> None:
+        """Sized from `rate_limit_per_minute` via `desired_worker_count` by
+        default - right for job types that are one fast JSON call each, the
+        case every caller but `download-attachments` is in. Pass
+        `worker_count` directly instead when jobs are bandwidth-bound rather
+        than request-rate-bound (multi-second/minute file transfers): worker
+        count there is a concurrency knob, not a function of how many API
+        calls/minute are allowed - see `client.download_file`'s `pace`
+        param for the other half of that split."""
         with self._lock:
             if self._workers:
                 return
-            self._spawn_locked(desired_worker_count(rate_limit_per_minute))
+            count = worker_count if worker_count is not None else desired_worker_count(rate_limit_per_minute)
+            self._spawn_locked(count)
 
     def resize(self, rate_limit_per_minute: int) -> None:
         target = desired_worker_count(rate_limit_per_minute)

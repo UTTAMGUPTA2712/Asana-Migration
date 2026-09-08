@@ -203,13 +203,32 @@ class AsanaClient:
         fields = "gid,name,host,download_url,view_url,permanent_url,size,resource_subtype,created_at"
         yield from self.paginate(f"/tasks/{task_gid}/attachments", {"opt_fields": fields})
 
-    def download_file(self, url: str) -> bytes:
+    def get_attachment(self, attachment_gid: str) -> dict:
+        """Single attachment, fetched fresh - the whole point of calling
+        this separately from `get_attachments_for_task` is that it mints a
+        brand-new `download_url`, good for another ~30 minutes. Callers
+        that actually intend to download bytes should call this right
+        before `download_file`, not reuse whatever URL was saved earlier."""
+        fields = "gid,name,host,download_url,view_url,permanent_url,size,resource_subtype,created_at"
+        return self.get(f"/attachments/{attachment_gid}", {"opt_fields": fields})["data"]
+
+    def download_file(self, url: str, *, pace: bool = True) -> bytes:
         """Fetch raw bytes from an attachment's (short-lived, pre-signed)
         download_url. This isn't an api.asana.com call - it doesn't carry our
-        bearer token and doesn't count against Asana's API rate limit - but
-        it's still paced through the same limiter so a task with many
-        attachments doesn't burst a pile of downloads at once."""
-        self.rate_limiter.acquire()
+        bearer token and doesn't count against Asana's API rate limit.
+
+        `pace=True` (the default) still runs it through the shared limiter,
+        for any caller that only ever fetches a handful of these alongside
+        normal API traffic and wants everything under one knob. The bulk
+        `download-attachments` command passes `pace=False`: sharing one
+        per-minute token bucket sized for fast JSON calls (see
+        `worker.RPM_PER_WORKER`) with multi-second/minute file transfers
+        just adds contention for no protective benefit - Asana isn't
+        rate-limiting this endpoint in the first place - and that command
+        bounds concurrency (and therefore how many downloads can ever race
+        each other) through its own `--concurrency` worker count instead."""
+        if pace:
+            self.rate_limiter.acquire()
         resp = requests.get(url, timeout=self.timeout)
         resp.raise_for_status()
         return resp.content

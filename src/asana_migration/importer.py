@@ -25,7 +25,7 @@ from pathlib import Path
 
 from .client import AsanaClient
 from .jobs import JobQueue
-from .storage import Meta, Paths, TaskIndex, now_iso, read_json, write_json
+from .storage import AttachmentsFile, Meta, Paths, TaskIndex, now_iso, read_json, safe_filename, write_bytes, write_json
 
 log = logging.getLogger("asana_migration.importer")
 
@@ -397,6 +397,90 @@ def h_import_task_attachments(ctx: ImporterContext, payload: dict) -> None:
     log.info("Task %s: saved %d attachment link(s) (no download)", task_gid, len(attachments))
 
 
+def h_download_task_attachment(ctx: ImporterContext, payload: dict) -> None:
+    """Downloads one attachment's actual bytes to
+    `<task_dir>/attachments/<gid>_<name>`. Deliberately its own job (queued
+    by `queue_pending_attachment_downloads`, run separately via the
+    `download-attachments` CLI command) rather than folded into
+    `h_import_task_attachments` above: that handler only ever lists
+    metadata, run once per task during the main crawl; downloading can be
+    re-run independently, any time later, without re-walking the tree.
+
+    Always re-fetches the attachment fresh via `get_attachment` rather than
+    trusting whatever `download_url` is sitting in attachments.json - that
+    one was minted whenever the metadata was last listed and is very likely
+    already expired by the time this job actually runs. The fresh URL from
+    this call is used within the same request/response cycle, well inside
+    its ~30 minute lifetime."""
+    workspace_dir = Path(payload["workspace_dir"])
+    task_gid = payload["task_gid"]
+    attachment_gid = payload["attachment_gid"]
+    task_dir = ctx.paths.task_dir(workspace_dir, task_gid)
+
+    attachment = ctx.client.get_attachment(attachment_gid)
+    if attachment.get("host") != "asana" or not attachment.get("download_url"):
+        # gdrive/external attachments are links Asana never hosted bytes
+        # for (download_url is null) - the saved view_url is already the
+        # whole story, nothing to fetch.
+        log.info("Attachment %s: host=%s, no bytes to download - skipping", attachment_gid, attachment.get("host"))
+        return
+
+    filename = f"{attachment_gid}_{safe_filename(attachment.get('name'))}"
+    dest = task_dir / "attachments" / filename
+    expected_size = attachment.get("size")
+    if dest.exists() and (expected_size is None or dest.stat().st_size == expected_size):
+        log.info("Task %s: attachment %s already downloaded (%s) - skipping", task_gid, attachment_gid, filename)
+    else:
+        log.info("Task %s: downloading attachment %s '%s' (%s bytes)...",
+                  task_gid, attachment_gid, attachment.get("name"), expected_size)
+        # pace=False: this is a CloudFront/S3 fetch, not an Asana API call -
+        # see download_file's docstring. Concurrency (how many of these can
+        # ever run at once) is bounded by the worker pool's --concurrency
+        # instead of the API rate limiter.
+        content = ctx.client.download_file(attachment["download_url"], pace=False)
+        write_bytes(dest, content)
+        log.info("Task %s: attachment %s saved (%d bytes) to %s", task_gid, attachment_gid, len(content), dest)
+
+    AttachmentsFile(task_dir).update_entry(
+        attachment_gid,
+        local_path=str(dest.relative_to(task_dir)),
+        downloaded_at=now_iso(),
+    )
+
+
+def queue_pending_attachment_downloads(ctx: ImporterContext) -> tuple[int, int]:
+    """Walks every already-imported task's attachments.json on disk and
+    queues a `download_task_attachment` job for each Asana-hosted
+    attachment that isn't saved to disk yet (gdrive/external attachments -
+    `host != "asana"` - are skipped, they have no bytes to fetch). Driven
+    entirely from local files, not from Asana's project/task tree, so this
+    can run as its own pass any time after (or during, on a re-run) the
+    main import - see the `download-attachments` CLI command.
+
+    Returns (queued, already_done) purely for the caller's log line."""
+    queued = already_done = 0
+    for attachments_path in ctx.paths.root.glob("*/tasks/*/attachments.json"):
+        task_dir = attachments_path.parent
+        workspace_dir = task_dir.parent.parent
+        task_gid = task_dir.name.split("_", 1)[0]
+        attachments = read_json(attachments_path, default=[]) or []
+        for att in attachments:
+            if att.get("host") != "asana" or not att.get("gid"):
+                continue
+            local_path = att.get("local_path")
+            if local_path and (task_dir / local_path).exists():
+                already_done += 1
+                continue
+            job = ctx.queue.push(
+                "download_task_attachment",
+                {"workspace_dir": str(workspace_dir), "task_gid": task_gid, "attachment_gid": att["gid"]},
+                dedupe_key=f"download_attachment:{att['gid']}",
+            )
+            if job:
+                queued += 1
+    return queued, already_done
+
+
 def h_import_subtasks(ctx: ImporterContext, payload: dict) -> None:
     workspace_dir = Path(payload["workspace_dir"])
     project_dir = Path(payload["project_dir"])
@@ -436,6 +520,7 @@ HANDLERS = {
     "import_task_comments": h_import_task_comments,
     "import_task_attachments": h_import_task_attachments,
     "import_subtasks": h_import_subtasks,
+    "download_task_attachment": h_download_task_attachment,
 }
 
 

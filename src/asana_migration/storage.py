@@ -32,8 +32,16 @@ just hold lightweight indexes pointing into those pools::
             comments.json        # just the type=="comment" subset of stories.json
             collaborators.json   # followers, resolved
             attachments.json     # attachment metadata + links (all hosts) -
-                                  #   never downloaded, view_url/permanent_url/
-                                  #   download_url only (the last expires fast)
+                                  #   view_url/permanent_url/download_url as
+                                  #   listed (the last expires fast, don't
+                                  #   trust it later); each entry also gains
+                                  #   local_path/downloaded_at once `asana-
+                                  #   migration download-attachments` has
+                                  #   actually fetched its bytes
+            attachments/          # downloaded bytes for this task's Asana-
+                                  #   hosted attachments (gdrive/external
+                                  #   ones have no bytes to fetch), named
+                                  #   <attachment_gid>_<original filename>
         teams/
           <team_gid>_<slug>/
             team.json
@@ -102,6 +110,21 @@ def slugify(name: str | None, fallback: str = "untitled") -> str:
 
 def gid_dir(base: Path, gid: str, name: str | None) -> Path:
     return base / f"{gid}_{slugify(name)}"
+
+
+_unsafe_filename_re = re.compile(r"[\\/\x00-\x1f]")
+
+
+def safe_filename(name: str | None, fallback: str = "file") -> str:
+    """Unlike `slugify`, keeps the real name (dots, case, spaces) intact -
+    downloaded attachments need their actual extension to stay openable and
+    to carry a sane content-type once pushed elsewhere. Only strips path
+    separators and control characters, since the result becomes a filename
+    on disk."""
+    if not name:
+        return fallback
+    cleaned = _unsafe_filename_re.sub("_", name.strip())
+    return cleaned[:200] or fallback
 
 
 def read_json(path: Path, default=None):
@@ -197,6 +220,30 @@ class TaskIndex:
             entry = data.get(task_gid, {"gid": task_gid})
             entry.update(fields)
             data[task_gid] = entry
+            write_json(self.path, data)
+
+
+class AttachmentsFile:
+    """Locked read/update of one task's `attachments.json`. Downloading a
+    task's attachments can run several at once (one job per attachment, see
+    `download_task_attachment` in importer.py), all writing back into this
+    same file to record where each one landed on disk - so, like `Meta` and
+    `TaskIndex`, every write goes through a read-modify-write under lock
+    rather than clobbering whatever another worker just wrote."""
+
+    def __init__(self, task_dir: Path):
+        self.path = task_dir / "attachments.json"
+
+    def read(self) -> list[dict]:
+        return read_json(self.path, default=[]) or []
+
+    def update_entry(self, attachment_gid: str, **fields) -> None:
+        with _locked(self.path):
+            data = self.read()
+            for entry in data:
+                if entry.get("gid") == attachment_gid:
+                    entry.update(fields)
+                    break
             write_json(self.path, data)
 
 

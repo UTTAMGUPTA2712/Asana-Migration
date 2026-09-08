@@ -34,6 +34,12 @@ from pathlib import Path
 
 log = logging.getLogger("asana_migration.import_all")
 
+# How many attachments download-attachments fetches at once by default.
+# Unrelated to the Asana API rate limit (see _cmd_download_attachments) -
+# this just bounds concurrent outbound connections/local disk writes, so
+# it's conservative-but-raisable rather than derived from anything.
+DEFAULT_DOWNLOAD_CONCURRENCY = 12
+
 
 def _default_serve_host() -> str:
     """127.0.0.1 everywhere except inside a container, where that's
@@ -233,6 +239,96 @@ def _cmd_import_all(args: argparse.Namespace) -> None:
     log.info("Data written under ./data - browse it with `uv run serve`.")
 
 
+def _cmd_download_attachments(args: argparse.Namespace) -> None:
+    """Second pass, run independently of `import-all`: downloads the actual
+    bytes for every Asana-hosted attachment already listed in some task's
+    attachments.json but not yet saved to disk. Doesn't touch Asana's
+    project/task tree at all - it only walks ./data, so it's safe to run
+    (and re-run) any time after an import, and only ever redoes attachments
+    it doesn't already have on disk."""
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)-7s [%(threadName)s] %(name)s: %(message)s",
+    )
+    if not args.verbose:
+        logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+    from . import config as config_mod
+    from .client import AsanaAuthError, AsanaClient
+    from .importer import ImporterContext, queue_pending_attachment_downloads
+    from .jobs import JobQueue
+    from .rate_limiter import RateLimiter
+    from .worker import WorkerPool
+    from .storage import Paths
+
+    cfg = config_mod.load_config()
+    token = args.token or cfg.token
+    if not token:
+        token = getpass.getpass("Asana personal access token: ").strip()
+    if not token:
+        log.error("No token provided. Pass --token, or run once with the token to save it.")
+        raise SystemExit(1)
+
+    rate_limit = args.rate_limit or cfg.rate_limit_per_minute
+    rate_limiter = RateLimiter(rate_limit)
+    client = AsanaClient(token, rate_limiter)
+    try:
+        client.get_me()
+    except AsanaAuthError as exc:
+        log.error("%s", exc)
+        raise SystemExit(1)
+
+    ctx = ImporterContext(client=client, paths=Paths(), queue=JobQueue())
+
+    log.info("Scanning ./data for attachments not downloaded yet...")
+    queued, already_done = queue_pending_attachment_downloads(ctx)
+    log.info("%d attachment(s) queued to download, %d already on disk.", queued, already_done)
+    if not queued:
+        log.info("Nothing to do.")
+        return
+
+    # Deliberately NOT desired_worker_count(rate_limit): that formula sizes
+    # workers assuming one fast JSON call per job (~75/min/worker), but a
+    # download job is one tiny metadata call plus however long a multi-MB
+    # file transfer takes - sizing off the API rate limit here starves
+    # actual throughput (e.g. 1500 rpm -> 20 workers -> maybe ~100
+    # downloads/min if each takes ~12s, nowhere near what 1500 rpm implies).
+    # Concurrency is its own knob because it's bandwidth-bound, not
+    # request-rate-bound; the metadata call each job makes is still paced
+    # by the real rate limiter no matter how many workers there are, so
+    # this can't overrun Asana's actual API quota.
+    log.info("Downloading with %d worker(s) (bandwidth-bound, independent of the %d req/min API rate limit)...",
+              args.concurrency, rate_limit)
+    start = time.monotonic()
+    done_at_start = ctx.queue.stats()["done"]
+    pool = WorkerPool(ctx)
+    pool.start(worker_count=args.concurrency)
+    last_report = start
+    try:
+        while True:
+            stats = ctx.queue.stats()
+            if stats["queued"] == 0 and stats["running"] == 0:
+                break
+            now = time.monotonic()
+            if now - last_report >= 15:
+                log.info(
+                    "Progress: %d/%d downloaded so far | %d failed permanently",
+                    stats["done"] - done_at_start, queued, stats["error"],
+                )
+                last_report = now
+            time.sleep(1)
+    finally:
+        pool.stop()
+
+    stats = ctx.queue.stats()
+    elapsed = time.monotonic() - start
+    log.info("=== Done in %.1fs: %d downloaded, %d failed permanently ===",
+              elapsed, stats["done"] - done_at_start, stats["error"])
+    if stats["error"]:
+        log.warning("Some downloads failed permanently after retries. Re-run `download-attachments` to retry just those.")
+    log.info("Files written under ./data/<workspace>/tasks/<task>/attachments/")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="asana-migration")
     sub = parser.add_subparsers(dest="command")
@@ -256,6 +352,23 @@ def build_parser() -> argparse.ArgumentParser:
                              help="Log every HTTP request/page fetch, not just the narrative summary.")
     import_all.set_defaults(func=_cmd_import_all)
 
+    download_attachments = sub.add_parser(
+        "download-attachments",
+        help="Download the actual file bytes for every already-imported, Asana-hosted attachment not yet on disk.",
+    )
+    download_attachments.add_argument("--token", help="Asana personal access token (else uses the saved one, or prompts).")
+    download_attachments.add_argument("--rate-limit", type=int, metavar="RPM",
+                                       help="Requests/minute for the one real Asana API call per attachment "
+                                            "(metadata fetch) - overrides the saved setting. Does NOT bound "
+                                            "the file transfers themselves; see --concurrency for that.")
+    download_attachments.add_argument("--concurrency", type=int, default=DEFAULT_DOWNLOAD_CONCURRENCY, metavar="N",
+                                       help=f"How many attachments to download at once (default {DEFAULT_DOWNLOAD_CONCURRENCY}). "
+                                            "Bandwidth-bound, not request-rate-bound - unrelated to --rate-limit, "
+                                            "raise it freely to use more of your network/disk throughput.")
+    download_attachments.add_argument("-v", "--verbose", action="store_true",
+                                       help="Log every HTTP request/download, not just the narrative summary.")
+    download_attachments.set_defaults(func=_cmd_download_attachments)
+
     return parser
 
 
@@ -276,6 +389,11 @@ def serve_main() -> None:
 def import_all_main() -> None:
     """Console-script entry point for `import-all` (and `uv run import-all`)."""
     main(["import-all", *sys.argv[1:]])
+
+
+def download_attachments_main() -> None:
+    """Console-script entry point for `download-attachments` (and `uv run download-attachments`)."""
+    main(["download-attachments", *sys.argv[1:]])
 
 
 if __name__ == "__main__":
