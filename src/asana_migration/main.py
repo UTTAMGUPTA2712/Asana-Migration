@@ -279,11 +279,26 @@ def _cmd_download_attachments(args: argparse.Namespace) -> None:
         raise SystemExit(1)
 
     ctx = ImporterContext(client=client, paths=Paths(), queue=JobQueue())
+    is_download_job = lambda j: j.type == "download_task_attachment"  # noqa: E731
 
     log.info("Scanning ./data for attachments not downloaded yet...")
     queued, already_done = queue_pending_attachment_downloads(ctx)
-    log.info("%d attachment(s) queued to download, %d already on disk.", queued, already_done)
-    if not queued:
+    # `queued` only counts jobs *this scan* newly added - JobQueue.push()'s
+    # dedupe (jobs.py) silently skips re-adding one already queued/running/
+    # done from an earlier `download-attachments` run, so on a second run
+    # `queued` reads 0 even with plenty of earlier-queued work still
+    # outstanding. The real "is there anything left" answer is whatever's
+    # actually sitting in the shared queue for this job type right now,
+    # regardless of which run put it there - that's what decides whether to
+    # start a pool, not this scan's own delta.
+    outstanding_stats = ctx.queue.stats_for(is_download_job)
+    outstanding = outstanding_stats["queued"] + outstanding_stats["running"]
+    log.info(
+        "%d attachment(s) newly queued this scan, %d already on disk, %d total still outstanding "
+        "(including any queued by an earlier run and not yet drained).",
+        queued, already_done, outstanding,
+    )
+    if not outstanding:
         log.info("Nothing to do.")
         return
 
@@ -300,27 +315,34 @@ def _cmd_download_attachments(args: argparse.Namespace) -> None:
     log.info("Downloading with %d worker(s) (bandwidth-bound, independent of the %d req/min API rate limit)...",
               args.concurrency, rate_limit)
     start = time.monotonic()
-    done_at_start = ctx.queue.stats()["done"]
+    done_at_start = outstanding_stats["done"]
+    total_for_type = outstanding + done_at_start + outstanding_stats["error"]
     pool = WorkerPool(ctx)
     pool.start(worker_count=args.concurrency)
     last_report = start
     try:
         while True:
-            stats = ctx.queue.stats()
+            # Scoped to this job type, not ctx.queue.stats()'s global count -
+            # `serve` (or another download-attachments run) can share this
+            # same queue with other job types alive at the same time, and a
+            # global "queued==0 and running==0" would never fire while any
+            # of those are still going, or would fire too early/misreport
+            # progress if they aren't.
+            stats = ctx.queue.stats_for(is_download_job)
             if stats["queued"] == 0 and stats["running"] == 0:
                 break
             now = time.monotonic()
             if now - last_report >= 15:
                 log.info(
                     "Progress: %d/%d downloaded so far | %d failed permanently",
-                    stats["done"] - done_at_start, queued, stats["error"],
+                    stats["done"] - done_at_start, total_for_type, stats["error"],
                 )
                 last_report = now
             time.sleep(1)
     finally:
         pool.stop()
 
-    stats = ctx.queue.stats()
+    stats = ctx.queue.stats_for(is_download_job)
     elapsed = time.monotonic() - start
     log.info("=== Done in %.1fs: %d downloaded, %d failed permanently ===",
               elapsed, stats["done"] - done_at_start, stats["error"])

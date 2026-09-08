@@ -170,6 +170,20 @@ class JobQueue:
             jobs = self._load()
             return sum(1 for j in jobs.values() if j.status in ("queued", "running") and predicate(j))
 
+    def stats_for(self, predicate) -> dict:
+        """Like `stats()`, but scoped to jobs matching `predicate` (e.g.
+        `lambda j: j.type == "download_task_attachment"`) - needed anywhere
+        the queue is shared with other job types (every command shares one
+        `var/jobs.json`, see jobs.py's module docstring) and a caller wants
+        to know how much of *its* work is left, not the whole file's."""
+        with self._locked():
+            jobs = self._load()
+            out = {"queued": 0, "running": 0, "done": 0, "error": 0}
+            for job in jobs.values():
+                if predicate(job):
+                    out[job.status] = out.get(job.status, 0) + 1
+            return out
+
     def errors_for(self, predicate) -> list[Job]:
         with self._locked():
             jobs = self._load()
