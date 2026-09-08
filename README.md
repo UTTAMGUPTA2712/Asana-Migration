@@ -167,6 +167,51 @@ file transfer itself isn't an api.asana.com call and doesn't count against
 Asana's limit at all — see **Rate limiting** below). `--token` and `-v` work
 the same as `import-all`.
 
+## Checking how much disk space attachments need
+
+```bash
+uv run estimate-storage
+```
+
+Pure local-disk arithmetic - reads what `import-all` already saved under
+`./data`, makes zero Asana calls, and needs no token. Useful before running
+`download-attachments` (or mid-run, to see what's left) if you want to know
+the download is going to fit:
+
+```
+Attachments by host:
+  asana        2644
+  external      151  (link only - never downloaded)
+  gdrive         53  (link only - never downloaded)
+
+Downloadable (host=asana):    2644 file(s), 11.8 GB total
+Already on disk:              1666 file(s), 7.1 GB
+Still to download:             978 file(s), 4.8 GB
+
+Size distribution (all Asana-hosted attachments, downloaded or not):
+  smallest: 1.7 KB
+  median:   118.9 KB
+  p90:      16.7 MB
+  p99:      55.3 MB
+  largest:  100.0 MB
+
+Free space on ./data's disk: 85.3 GB
+  -> enough room - 80.6 GB left over after downloading the rest.
+```
+
+Only `host: "asana"` attachments count toward any of these totals -
+`gdrive`/`external` ones never had bytes to download in the first place (see
+**Downloading the actual attachment files** above), so they're listed but
+excluded from the size math. "Already on disk" is exactly the same
+`local_path` + file-size check `download-attachments` itself uses to decide
+what to skip, so the "still to download" number is a true preview of what a
+`download-attachments` run would actually do next.
+
+Also available as a standalone script if you'd rather point it somewhere
+other than `./data` without an env var: `uv run python
+scripts/estimate_attachment_storage.py --data-dir /path/to/data` - same
+numbers, same code underneath.
+
 ## Or: run it in Docker
 
 ```bash
@@ -177,15 +222,16 @@ docker compose up -d --build
 on its own after a rebuild/recreate (`restart: unless-stopped` + baked into
 the image's `CMD`).
 
-For `import-all`, `download-attachments`, or anything else, open a shell in
-the same running container - it runs safely alongside the auto-started
-`serve`, sharing the same mounted `data/`/`var/` (the job queue is safe for
-concurrent access):
+For `import-all`, `download-attachments`, `estimate-storage`, or anything
+else, open a shell in the same running container - it runs safely alongside
+the auto-started `serve`, sharing the same mounted `data/`/`var/` (the job
+queue is safe for concurrent access):
 
 ```bash
 docker compose exec asana-migration bash
 import-all
 download-attachments
+estimate-storage
 ```
 
 `serve` auto-detects it's running in a container (checks for `/.dockerenv`)

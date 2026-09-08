@@ -17,6 +17,7 @@ asana-migration = "asana_migration.main:main"
 serve = "asana_migration.main:serve_main"
 import-all = "asana_migration.main:import_all_main"
 download-attachments = "asana_migration.main:download_attachments_main"
+estimate-storage = "asana_migration.main:estimate_storage_main"
 
 [build-system]
 requires = ["uv_build>=0.12.4,<0.13.0"]

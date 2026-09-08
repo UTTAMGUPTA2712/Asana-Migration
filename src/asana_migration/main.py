@@ -329,6 +329,85 @@ def _cmd_download_attachments(args: argparse.Namespace) -> None:
     log.info("Files written under ./data/<workspace>/tasks/<task>/attachments/")
 
 
+def _human_bytes(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def _percentile(sorted_vals: list[int], p: float) -> int:
+    if not sorted_vals:
+        return 0
+    k = max(0, min(len(sorted_vals) - 1, round(p * (len(sorted_vals) - 1))))
+    return sorted_vals[k]
+
+
+def _cmd_estimate_storage(args: argparse.Namespace) -> None:
+    """Pure local-disk arithmetic, no Asana API calls and no token needed -
+    reads what `import-all` already saved under ./data and reports how much
+    space `download-attachments` needs, in total and still remaining."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    from .importer import estimate_attachment_storage
+    from .storage import Paths
+
+    paths = Paths()
+    if not paths.root.exists():
+        log.error("No data directory at %s - nothing imported yet.", paths.root)
+        raise SystemExit(1)
+
+    stats = estimate_attachment_storage(paths)
+
+    log.info("Scanned %d task(s) under %s\n", stats["tasks_scanned"], paths.root)
+
+    log.info("Attachments by host:")
+    for host, count in sorted(stats["by_host"].items(), key=lambda kv: -kv[1]):
+        note = "" if host == "asana" else "  (link only - never downloaded)"
+        log.info("  %-10s %6d%s", host, count, note)
+    log.info("")
+
+    if stats["missing_size_count"]:
+        log.info(
+            "Note: %d Asana-hosted attachment(s) have no reported size yet "
+            "(not counted below - re-fetch their metadata, e.g. via `import-all`, to know for sure).\n",
+            stats["missing_size_count"],
+        )
+
+    log.info("Downloadable (host=asana):  %6d file(s), %s total",
+              stats["asana_count"], _human_bytes(stats["downloadable_total_bytes"]))
+    log.info("Already on disk:            %6d file(s), %s",
+              stats["downloaded_count"], _human_bytes(stats["downloaded_total_bytes"]))
+    log.info("Still to download:          %6d file(s), %s\n",
+              stats["remaining_count"], _human_bytes(stats["remaining_bytes"]))
+
+    sizes = stats["asana_sizes_sorted"]
+    if sizes:
+        log.info("Size distribution (all Asana-hosted attachments, downloaded or not):")
+        log.info("  smallest: %s", _human_bytes(sizes[0]))
+        log.info("  median:   %s", _human_bytes(_percentile(sizes, 0.50)))
+        log.info("  p90:      %s", _human_bytes(_percentile(sizes, 0.90)))
+        log.info("  p99:      %s", _human_bytes(_percentile(sizes, 0.99)))
+        log.info("  largest:  %s\n", _human_bytes(sizes[-1]))
+
+    try:
+        import shutil
+        usage = shutil.disk_usage(paths.root)
+        log.info("Free space on %s's disk: %s", paths.root, _human_bytes(usage.free))
+        remaining = stats["remaining_bytes"]
+        if remaining:
+            if usage.free >= remaining:
+                log.info("  -> enough room - %s left over after downloading the rest.",
+                          _human_bytes(usage.free - remaining))
+            else:
+                log.warning("  -> NOT enough room - short by %s.", _human_bytes(remaining - usage.free))
+        else:
+            log.info("  -> nothing left to download.")
+    except OSError as exc:
+        log.warning("Couldn't check free disk space: %s", exc)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="asana-migration")
     sub = parser.add_subparsers(dest="command")
@@ -369,6 +448,13 @@ def build_parser() -> argparse.ArgumentParser:
                                        help="Log every HTTP request/download, not just the narrative summary.")
     download_attachments.set_defaults(func=_cmd_download_attachments)
 
+    estimate_storage = sub.add_parser(
+        "estimate-storage",
+        help="Report how much disk space downloading every attachment needs (total, done, remaining) - "
+             "reads ./data only, no Asana call, no token.",
+    )
+    estimate_storage.set_defaults(func=_cmd_estimate_storage)
+
     return parser
 
 
@@ -394,6 +480,11 @@ def import_all_main() -> None:
 def download_attachments_main() -> None:
     """Console-script entry point for `download-attachments` (and `uv run download-attachments`)."""
     main(["download-attachments", *sys.argv[1:]])
+
+
+def estimate_storage_main() -> None:
+    """Console-script entry point for `estimate-storage` (and `uv run estimate-storage`)."""
+    main(["estimate-storage", *sys.argv[1:]])
 
 
 if __name__ == "__main__":

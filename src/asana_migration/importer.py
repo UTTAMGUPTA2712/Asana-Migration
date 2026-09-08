@@ -481,6 +481,63 @@ def queue_pending_attachment_downloads(ctx: ImporterContext) -> tuple[int, int]:
     return queued, already_done
 
 
+def estimate_attachment_storage(paths: Paths) -> dict:
+    """Pure local-disk arithmetic, same walk as `queue_pending_attachment_downloads`
+    but read-only and stats-only - no Asana API calls, no token, no
+    ImporterContext needed. Used by the `estimate-storage` CLI command (and
+    the standalone `scripts/estimate_attachment_storage.py`) to answer "how
+    much disk space will `download-attachments` need" before or during a run.
+
+    Only `host == "asana"` attachments count toward any of this - gdrive/
+    external ones never have bytes to download (see
+    `h_download_task_attachment`'s docstring), so they'd only distort the
+    total if included."""
+    by_host: dict[str, int] = {}
+    asana_sizes: list[int] = []
+    downloadable_total = 0
+    downloaded_total = 0
+    downloaded_count = 0
+    missing_size_count = 0
+    tasks_scanned = 0
+
+    for attachments_path in paths.root.glob("*/tasks/*/attachments.json"):
+        tasks_scanned += 1
+        task_dir = attachments_path.parent
+        attachments = read_json(attachments_path, default=[]) or []
+        for att in attachments:
+            host = att.get("host") or "unknown"
+            by_host[host] = by_host.get(host, 0) + 1
+            if host != "asana":
+                continue
+
+            size = att.get("size")
+            if size is None:
+                missing_size_count += 1
+            else:
+                downloadable_total += size
+                asana_sizes.append(size)
+
+            local_path = att.get("local_path")
+            if local_path and (task_dir / local_path).exists():
+                downloaded_count += 1
+                downloaded_total += (task_dir / local_path).stat().st_size
+
+    asana_sizes.sort()
+    asana_count = by_host.get("asana", 0)
+    return {
+        "tasks_scanned": tasks_scanned,
+        "by_host": by_host,
+        "asana_count": asana_count,
+        "downloadable_total_bytes": downloadable_total,
+        "downloaded_count": downloaded_count,
+        "downloaded_total_bytes": downloaded_total,
+        "remaining_count": asana_count - downloaded_count,
+        "remaining_bytes": max(0, downloadable_total - downloaded_total),
+        "missing_size_count": missing_size_count,
+        "asana_sizes_sorted": asana_sizes,
+    }
+
+
 def h_import_subtasks(ctx: ImporterContext, payload: dict) -> None:
     workspace_dir = Path(payload["workspace_dir"])
     project_dir = Path(payload["project_dir"])
