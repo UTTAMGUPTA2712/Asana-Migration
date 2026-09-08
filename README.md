@@ -1,8 +1,10 @@
 # Asana Migration
 
 Exports an Asana account — teams, projects, sections, tasks, subtasks (nested,
-any depth), comments, and collaborators — to a local, browsable JSON folder
-tree, without ever exceeding Asana's API rate limit.
+any depth), comments, collaborators, and attachments — to a local, browsable
+JSON folder tree, without ever exceeding Asana's API rate limit. Attachment
+metadata (links, size, host) is captured during the main import; the actual
+file bytes are a separate, optional pass — see `download-attachments` below.
 
 It's built to run **slowly and resumably**: everything heavier than "list a
 team's projects" goes through a persistent job queue that a single background
@@ -120,6 +122,51 @@ single job, so re-running `import-all` (or opening the web UI) picks up
 exactly where it stopped. It shares the same `var/`/`data/` directories as
 `serve`, so work started one way can be finished the other.
 
+## Downloading the actual attachment files
+
+`import-all` (and the web UI) only ever save attachment *metadata* — name,
+size, host, and Asana's links (`attachments.json` per task). They never fetch
+the file bytes, on purpose: Asana's `download_url`/`view_url` are short-lived
+signed URLs (good for roughly 30 minutes from when they're listed), so saving
+the actual file has to happen right when a fresh URL is minted, not
+whenever the metadata happened to be crawled — often hours or days earlier.
+
+```bash
+uv run download-attachments
+```
+
+This is a separate, independent pass: it doesn't touch Asana's project/task
+tree at all, it just walks every `attachments.json` already on disk under
+`./data`. For each attachment:
+
+- **Asana-hosted files** (`host: "asana"`, ~93% of attachments in a typical
+  export) — re-fetches that one attachment fresh (`GET /attachments/{gid}`)
+  to mint a brand-new `download_url`, downloads it immediately, and saves it
+  to `<task>/attachments/<attachment_gid>_<original filename>`. The
+  attachment's entry in `attachments.json` gains `local_path` and
+  `downloaded_at` once it's on disk.
+- **`gdrive`/`external` attachments** (a Google Drive file, a Figma link, …)
+  — skipped. Asana never hosted bytes for these (`download_url` is `null`
+  in the metadata); the saved `view_url` link is already the whole story.
+
+It's safe to `Ctrl+C` and re-run at any time — an attachment already saved to
+disk (checked by `local_path` + matching file size) is skipped, not
+re-downloaded, so a re-run only ever fetches what's still missing.
+
+**Images inline in a task's description or a comment are already covered.**
+Asana returns those as ordinary entries in the same `attachments.json` — an
+inline `<img>` isn't a separate kind of thing to track, it's just the same
+attachment object also referenced by its HTML. So this one command captures
+every file a task has, standalone or inline, with nothing extra to run.
+
+Useful flags: `--concurrency N` (default 12) controls how many files
+download at once — this is a bandwidth/disk knob, **not** the Asana API rate
+limit (each attachment still costs exactly one real API call, the metadata
+re-fetch, which *is* paced by `--rate-limit`/the saved setting as usual; the
+file transfer itself isn't an api.asana.com call and doesn't count against
+Asana's limit at all — see **Rate limiting** below). `--token` and `-v` work
+the same as `import-all`.
+
 ## Or: run it in Docker
 
 ```bash
@@ -130,13 +177,15 @@ docker compose up -d --build
 on its own after a rebuild/recreate (`restart: unless-stopped` + baked into
 the image's `CMD`).
 
-For `import-all` (or anything else), open a shell in the same running
-container - it runs safely alongside the auto-started `serve`, sharing the
-same mounted `data/`/`var/` (the job queue is safe for concurrent access):
+For `import-all`, `download-attachments`, or anything else, open a shell in
+the same running container - it runs safely alongside the auto-started
+`serve`, sharing the same mounted `data/`/`var/` (the job queue is safe for
+concurrent access):
 
 ```bash
 docker compose exec asana-migration bash
 import-all
+download-attachments
 ```
 
 `serve` auto-detects it's running in a container (checks for `/.dockerenv`)
@@ -177,6 +226,13 @@ it left off, not from page 1.
       project.json  members.json  sections.json  _meta.json  _index.json
     tasks/<task>/                  # every task/subtask, fetched once
       task.json  comments.json  collaborators.json
+      attachments.json             # metadata + links for every attachment
+                                    #   (standalone or inline in the
+                                    #   description/comments) - gains
+                                    #   local_path/downloaded_at once
+                                    #   `download-attachments` has run
+      attachments/                 # the actual files, once downloaded -
+                                    #   <attachment_gid>_<original filename>
     teams/<team>/
       team.json
       projects_index.json          # which project gids belong to this team
@@ -214,3 +270,13 @@ to the configured rate limit at roughly one worker per 75 requests/minute
 (e.g. 150 → 2 workers, 2000 → 27) - it resizes live when you change the
 rate limit in Settings, no restart needed, and `import-all` sizes its pool
 once at startup from whatever rate limit you confirm.
+
+`download-attachments` is the one exception to all of the above: its jobs
+are one small API call plus a multi-second/minute file transfer, not one
+fast JSON call, so sizing its worker pool off the rate limit the same way
+would badly under-use it (e.g. 1500 rpm → ~20 workers → maybe only ~100
+files/minute if each transfer takes ~12s). Its worker count is instead its
+own `--concurrency` flag (default 12, see above), independent of
+`--rate-limit` - concurrent file transfers aren't Asana API calls and don't
+draw from the rate limiter at all, only the one metadata re-fetch per
+attachment does.
