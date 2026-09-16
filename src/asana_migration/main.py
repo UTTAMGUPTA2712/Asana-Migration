@@ -369,14 +369,17 @@ def _cmd_download_attachments(args: argparse.Namespace) -> None:
 
 
 def _cmd_retry_failed_attachments(args: argparse.Namespace) -> None:
-    """Retries only the attachment downloads `download-attachments` already
-    gave up on (queue status `error`). That command's own retry policy is
-    blunt - 5 attempts, a fixed 30s timeout shared with ordinary JSON API
-    calls, no real backoff of its own beyond the queue's - so a big or
-    slow-to-fetch file fails the same way every time and exhausts it. This
-    gives each one a fresh, more forgiving shot instead: a bigger timeout,
-    its own backoff loop, bounded concurrency - see
-    `importer.retry_failed_attachment_downloads`. Anything that still fails
+    """Retries attachment downloads that need another shot: both ones
+    `download-attachments` already gave up on (queue status `error`) and
+    ones stuck silently marked `done` despite never actually saving a file
+    (see `importer.find_stuck_attachment_downloads`'s docstring for how a
+    job ends up in that state). That command's own retry policy is blunt -
+    5 attempts, a fixed 30s timeout shared with ordinary JSON API calls, no
+    real backoff of its own beyond the queue's - so a big or slow-to-fetch
+    file fails the same way every time and exhausts it. This gives each one
+    a fresh, more forgiving shot instead: a bigger timeout, its own backoff
+    loop, bounded concurrency - see `importer.retry_failed_attachment_downloads`.
+    Anything that still fails (including a stuck one that's still stuck)
     gets written to a dated JSON report under var/ with a classified reason
     per attachment, instead of leaving you to grep logs."""
     logging.basicConfig(
@@ -388,18 +391,29 @@ def _cmd_retry_failed_attachments(args: argparse.Namespace) -> None:
 
     from . import config as config_mod
     from .client import AsanaAuthError, AsanaClient
-    from .importer import ImporterContext, find_failed_attachment_downloads, retry_failed_attachment_downloads
+    from .importer import (
+        ImporterContext,
+        find_failed_attachment_downloads,
+        find_stuck_attachment_downloads,
+        retry_failed_attachment_downloads,
+    )
     from .jobs import JobQueue
     from .rate_limiter import RateLimiter
     from .storage import Paths
 
-    # Checked before asking for a token at all: this only reads jobs.json,
-    # and there's no point prompting for credentials for a no-op.
+    # Checked before asking for a token at all: this only reads jobs.json
+    # and disk, and there's no point prompting for credentials for a no-op.
     queue = JobQueue()
+    paths = Paths()
     failed_jobs = find_failed_attachment_downloads(queue)
-    if not failed_jobs:
-        log.info("No permanently-failed attachment downloads - nothing to retry.")
+    stuck_jobs = find_stuck_attachment_downloads(paths, queue)
+    all_jobs = failed_jobs + stuck_jobs
+    if not all_jobs:
+        log.info("No permanently-failed or stuck attachment downloads - nothing to retry.")
         return
+    if stuck_jobs:
+        log.info("%d permanently-failed, %d marked done but never actually saved - retrying both.",
+                  len(failed_jobs), len(stuck_jobs))
 
     cfg = config_mod.load_config()
     token = args.token or cfg.token
@@ -417,17 +431,17 @@ def _cmd_retry_failed_attachments(args: argparse.Namespace) -> None:
         log.error("%s", exc)
         raise SystemExit(1)
 
-    ctx = ImporterContext(client=client, paths=Paths(), queue=queue)
-    log.info("Retrying %d permanently-failed attachment download(s): up to %d attempt(s) each, "
-              "%.0fs timeout, %d at once...", len(failed_jobs), args.retries, args.timeout, args.concurrency)
+    ctx = ImporterContext(client=client, paths=paths, queue=queue)
+    log.info("Retrying %d attachment download(s): up to %d attempt(s) each, "
+              "%.0fs timeout, %d at once...", len(all_jobs), args.retries, args.timeout, args.concurrency)
 
     start = time.monotonic()
     succeeded, failures = retry_failed_attachment_downloads(
-        ctx, failed_jobs, retries=args.retries, timeout=args.timeout, concurrency=args.concurrency,
+        ctx, all_jobs, retries=args.retries, timeout=args.timeout, concurrency=args.concurrency,
     )
     elapsed = time.monotonic() - start
     log.info("=== Done in %.1fs: %d/%d recovered, %d still failing ===",
-              elapsed, succeeded, len(failed_jobs), len(failures))
+              elapsed, succeeded, len(all_jobs), len(failures))
 
     if failures:
         out_path = config_mod.VAR_DIR / f"attachment_retry_failures_{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.json"

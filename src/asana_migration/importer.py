@@ -536,23 +536,62 @@ def classify_attachment_download_error(exc: Exception, timeout: float) -> str:
     return f"unexpected error: {exc}"
 
 
+def _attachment_actually_downloaded(paths: Paths, payload: dict) -> bool:
+    """Ground truth for "did this attachment's bytes really land on disk" -
+    same disk-only check `estimate_attachment_storage` uses, as opposed to
+    trusting that the job finished without raising (see
+    `_retry_one_attachment`'s docstring for why those two can disagree).
+    Takes `paths` rather than a whole `ImporterContext` so callers (like
+    `find_stuck_attachment_downloads`) can use it before a client/token is
+    available - it never touches the network."""
+    task_dir = paths.task_dir(Path(payload["workspace_dir"]), payload["task_gid"])
+    attachment = next(
+        (a for a in AttachmentsFile(task_dir).read() if a.get("gid") == payload["attachment_gid"]),
+        None,
+    )
+    if attachment is None:
+        return False
+    local_path = attachment.get("local_path")
+    return bool(local_path) and (task_dir / local_path).exists()
+
+
 def _retry_one_attachment(ctx: ImporterContext, job: Job, retries: int, timeout: float) -> AttachmentRetryFailure | None:
     """Runs `h_download_task_attachment` up to `retries` times with backoff
-    (`RETRY_BACKOFF_SECONDS`) for one already-failed job. Returns None on
-    success (and marks the job `done`, same as a normal successful download),
-    or an `AttachmentRetryFailure` describing why it still didn't land."""
+    (`RETRY_BACKOFF_SECONDS`) for one already-failed *or* silently-stuck job
+    (see `find_stuck_attachment_downloads`). Returns None on success (and
+    marks the job `done`, same as a normal successful download), or an
+    `AttachmentRetryFailure` describing why it still didn't land.
+
+    A raised exception isn't the only way this can fail: the handler also
+    returns normally (no exception) whenever a fresh re-fetch says there's
+    nothing to download (host changed, or no `download_url` any more) - the
+    same "success" the original job saw. So every attempt is checked against
+    disk afterwards via `_attachment_actually_downloaded` rather than trusting
+    a clean return; a clean return with no file means the API has (still)
+    got nothing for us, which retrying further won't fix, so that ends the
+    attempt loop early instead of burning the rest of `retries`."""
     last_exc: Exception | None = None
+    skipped = False
     for attempt in range(1, retries + 1):
         try:
             h_download_task_attachment(ctx, job.payload)
-            ctx.queue.complete(job.id)
-            return None
         except Exception as exc:  # noqa: BLE001 - classified and reported by the caller
             last_exc = exc
             log.warning("job %s attachment %s: attempt %d/%d failed: %s",
                         job.id, job.payload.get("attachment_gid"), attempt, retries, exc)
             if attempt < retries:
                 time.sleep(RETRY_BACKOFF_SECONDS[min(attempt - 1, len(RETRY_BACKOFF_SECONDS) - 1)])
+            continue
+
+        if _attachment_actually_downloaded(ctx.paths, job.payload):
+            ctx.queue.complete(job.id)
+            return None
+        log.warning("job %s attachment %s: handler returned without error but nothing was saved "
+                    "(Asana has no download_url for it any more) - won't keep retrying", job.id,
+                    job.payload.get("attachment_gid"))
+        skipped = True
+        ctx.queue.complete(job.id)  # genuinely nothing left to do, same as a normal skip
+        break
 
     payload = job.payload
     task_dir = ctx.paths.task_dir(Path(payload["workspace_dir"]), payload["task_gid"])
@@ -561,6 +600,14 @@ def _retry_one_attachment(ctx: ImporterContext, job: Job, retries: int, timeout:
         (a for a in AttachmentsFile(task_dir).read() if a.get("gid") == payload["attachment_gid"]),
         {},
     )
+    if skipped:
+        reason = ("Asana no longer has a download_url for this attachment when re-fetched fresh (host "
+                   "changed, permissions changed, or it was deleted/converted since it was first "
+                   "imported) - there's nothing left for this tool to download; check it manually in Asana.")
+        last_error = "no exception raised - handler skipped the download (see reason)"
+    else:
+        reason = classify_attachment_download_error(last_exc, timeout)
+        last_error = str(last_exc)
     return AttachmentRetryFailure(
         job_id=job.id,
         workspace_dir=payload["workspace_dir"],
@@ -570,13 +617,36 @@ def _retry_one_attachment(ctx: ImporterContext, job: Job, retries: int, timeout:
         attachment_name=attachment.get("name"),
         attachment_size=attachment.get("size"),
         attempts_made=retries,
-        reason=classify_attachment_download_error(last_exc, timeout),
-        last_error=str(last_exc),
+        reason=reason,
+        last_error=last_error,
     )
 
 
 def find_failed_attachment_downloads(queue: JobQueue) -> list[Job]:
     return queue.errors_for(lambda j: j.type == "download_task_attachment")
+
+
+def find_stuck_attachment_downloads(paths: Paths, queue: JobQueue) -> list[Job]:
+    """`download_task_attachment` jobs marked `done` that never actually
+    saved a file - the handler returns normally (so the job completes like
+    any success) whenever a fresh re-fetch of the attachment comes back
+    `host != "asana"` or with no `download_url`, even if it was
+    `host == "asana"` with a real `download_url` back when first listed
+    (see `h_download_task_attachment`'s docstring). Once that happens the
+    job's `dedupe_key` blocks `queue_pending_attachment_downloads` from ever
+    re-queuing it (see `JobQueue.push`), so without this they'd stay
+    silently un-downloaded forever - `retry-attachments` also fetches these
+    (in addition to genuine `error` jobs from `find_failed_attachment_downloads`)
+    precisely so they get one more real attempt instead of vanishing. Takes
+    `paths`/`queue` directly (not a full `ImporterContext`) so the CLI can
+    check for these before asking for a token - see that command's own
+    no-op-avoidance comment."""
+    return [
+        job for job in queue.all_jobs()
+        if job.type == "download_task_attachment"
+        and job.status == "done"
+        and not _attachment_actually_downloaded(paths, job.payload)
+    ]
 
 
 def retry_failed_attachment_downloads(
