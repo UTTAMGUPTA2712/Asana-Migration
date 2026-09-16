@@ -530,10 +530,29 @@ def _progress_bar(done: int, total: int, width: int = 30) -> str:
 
 def _cmd_job_status(args: argparse.Namespace) -> None:
     """Point-in-time report on a work queue: how much is done/queued/running/
-    failed overall and per job type, how fast `done` jobs are landing, and a
+    failed per job type, how fast `done` jobs are landing recently, and a
     rough ETA for the rest - the same numbers `import-all`'s own 15s progress
     log prints, but on demand and without needing a foreground
     `import-all`/`serve` of your own running.
+
+    No "since it started" overall rate (and no "running for" elapsed time) -
+    jobs can be (re-)queued at any point via `import-all`/`download-
+    attachments` without the queue file being reset, so "since it started"
+    is measured from whichever job happens to still be the oldest with a
+    `started_at`, not from any real start of a run. That made the overall
+    rate (and the elapsed time it's derived from) swing arbitrarily based on
+    when jobs were generated rather than how fast they're currently being
+    worked - the windowed rate below doesn't have that problem.
+
+    For `download_task_attachment` specifically, the done/queued/running/
+    error counts reflect job outcomes, not bytes on disk: a job is marked
+    "done" once `h_download_task_attachment` returns without raising, which
+    includes attachments that turned out to have no `download_url` on
+    re-fetch (host changed, permissions, etc. - see that handler's
+    docstring) and so were skipped rather than actually saved. That's why
+    this can disagree with `estimate-storage`'s "Already on disk" count,
+    which instead checks the real file on disk - see the note printed below
+    the per-type table.
 
     Defaults to asana_migration's own queue (./var/jobs.json). Pass
     `--padmasana` to report on padmasana_migration's queue
@@ -565,33 +584,25 @@ def _cmd_job_status(args: argparse.Namespace) -> None:
     error_n = by_status["error"]
     remaining = queued_n + running_n
 
-    started = [j.started_at for j in jobs if j.started_at]
-    elapsed_min = (now - min(started)) / 60 if started else 0.0
-    overall_rate = done_n / elapsed_min if elapsed_min > 0 else 0.0
-
     window_min = max(0.1, args.window)
     window_sec = window_min * 60
     recent_done_n = sum(1 for j in done_jobs if j.started_at and now - j.started_at <= window_sec)
     recent_rate = recent_done_n / window_min
 
-    eta_rate = recent_rate or overall_rate
-    eta_min = remaining / eta_rate if eta_rate > 0 else None
+    eta_min = remaining / recent_rate if recent_rate > 0 else None
 
-    print(f"Job queue: {JOBS_PATH}  (checked {time.strftime('%Y-%m-%d %H:%M:%S %Z')})")
-    print(f"Running for: {elapsed_min:.1f} min\n")
+    print(f"Job queue: {JOBS_PATH}  (checked {time.strftime('%Y-%m-%d %H:%M:%S %Z')})\n")
 
     print(_progress_bar(done_n, total), f" {done_n}/{total} done, {remaining} left")
     print(f"  done: {done_n:>6}   queued: {queued_n:>6}   running: {running_n:>6}   error: {error_n:>6}\n")
 
     print("Save rate:")
-    print(f"  overall:        {overall_rate:7.1f} jobs/min  ({overall_rate / 60:.2f}/sec)  since it started")
     print(f"  last {window_min:g} min:    {recent_rate:7.1f} jobs/min  ({recent_done_n} job(s) in the window)")
     if eta_min is not None:
         eta_when = time.strftime("%H:%M:%S", time.localtime(now + eta_min * 60))
-        print(f"\nETA: ~{eta_min:.1f} min left at the {'recent' if recent_rate else 'overall'} rate "
-              f"(finish around {eta_when})")
+        print(f"\nETA: ~{eta_min:.1f} min left at the recent rate (finish around {eta_when})")
     else:
-        print("\nETA: n/a (no completed jobs yet)")
+        print("\nETA: n/a (no jobs completed in the window)")
 
     print("\nBy type:")
     types = sorted({j.type for j in jobs})
@@ -602,6 +613,17 @@ def _cmd_job_status(args: argparse.Namespace) -> None:
         t_jobs = [j for j in jobs if j.type == t]
         c = collections.Counter(j.status for j in t_jobs)
         print(f"  {t:<26}{c['done']:>8}{c['queued']:>8}{c['running']:>9}{c['error']:>8}{len(t_jobs):>8}")
+
+    if not args.padmasana and any(j.type == "download_task_attachment" for j in jobs):
+        from .importer import estimate_attachment_storage
+        from .storage import Paths
+
+        paths = Paths()
+        if paths.root.exists():
+            stats = estimate_attachment_storage(paths)
+            print(f"\nAttachment downloads (verified on disk, matches `estimate-storage`):")
+            print(f"  {stats['downloaded_count']:>6} downloaded, {stats['remaining_count']:>6} still to fetch, "
+                  f"out of {stats['asana_count']} Asana-hosted attachment(s)")
 
     if error_n:
         print(f"\n{error_n} job(s) failed permanently. See `retry-attachments` for attachment downloads, "
