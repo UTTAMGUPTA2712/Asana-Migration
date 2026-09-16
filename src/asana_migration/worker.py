@@ -25,7 +25,6 @@ import math
 import threading
 import time
 
-from .importer import HANDLERS, ImporterContext
 from .jobs import JobQueue
 
 log = logging.getLogger("asana_migration.worker")
@@ -42,9 +41,16 @@ class _WorkerThread:
     shrink cleanly - checked between jobs, never mid-request, so shrinking
     never kills work partway through."""
 
-    def __init__(self, ctx: ImporterContext, name: str, poll_interval: float = 1.0):
+    def __init__(self, ctx, name: str, poll_interval: float = 1.0, handlers: dict | None = None):
         self.ctx = ctx
         self.poll_interval = poll_interval
+        # Defaults to asana_migration's own job handlers so every existing
+        # caller (which never passed this) keeps working unmodified; other
+        # packages that share this pool for their own job types (e.g.
+        # padmasana_migration, see its DESIGN.md §4) pass their own dict.
+        if handlers is None:
+            from .importer import HANDLERS as handlers
+        self.handlers = handlers
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, name=name, daemon=True)
 
@@ -72,7 +78,7 @@ class _WorkerThread:
                 if job is None:
                     time.sleep(self.poll_interval)
                     continue
-                handler = HANDLERS.get(job.type)
+                handler = self.handlers.get(job.type)
                 if handler is None:
                     queue.fail(job.id, f"no handler registered for job type {job.type!r}")
                     continue
@@ -94,9 +100,10 @@ class WorkerPool:
     for, and can be resized live (e.g. when the rate limit changes in the
     web UI's Settings panel) without losing in-flight work."""
 
-    def __init__(self, ctx: ImporterContext, poll_interval: float = 1.0):
+    def __init__(self, ctx, poll_interval: float = 1.0, handlers: dict | None = None):
         self.ctx = ctx
         self.poll_interval = poll_interval
+        self.handlers = handlers
         self._lock = threading.Lock()
         self._workers: list[_WorkerThread] = []
         self._next_id = 1
@@ -133,7 +140,10 @@ class WorkerPool:
 
     def _spawn_locked(self, count: int) -> None:
         for _ in range(count):
-            w = _WorkerThread(self.ctx, name=f"asana-worker-{self._next_id}", poll_interval=self.poll_interval)
+            w = _WorkerThread(
+                self.ctx, name=f"asana-worker-{self._next_id}",
+                poll_interval=self.poll_interval, handlers=self.handlers,
+            )
             self._next_id += 1
             self._workers.append(w)
             w.start()
