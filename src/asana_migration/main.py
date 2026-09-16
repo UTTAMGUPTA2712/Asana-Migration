@@ -9,6 +9,14 @@
                                       # resumable, logging every step.
     uv run import-all --force --rate-limit 60 -v
 
+    uv run job-status                # done/queued/running/error counts,
+                                      # save rate, ETA and a per-type
+                                      # breakdown for the queue an
+                                      # `import-all`/`serve` is draining -
+                                      # safe to run from another shell while
+                                      # one of those is running.
+    uv run job-status --window 2
+
 (`uv run asana-migration serve` / `asana-migration import-all` work too, if
 installed outside a `uv run` context - all three console scripts point at
 the same subcommands below.)
@@ -512,6 +520,94 @@ def _cmd_estimate_storage(args: argparse.Namespace) -> None:
         log.warning("Couldn't check free disk space: %s", exc)
 
 
+def _progress_bar(done: int, total: int, width: int = 30) -> str:
+    if total <= 0:
+        return "[" + " " * width + "]   0%"
+    frac = min(1.0, done / total)
+    filled = round(width * frac)
+    return f"[{'#' * filled}{'-' * (width - filled)}] {frac * 100:5.1f}%"
+
+
+def _cmd_job_status(args: argparse.Namespace) -> None:
+    """Point-in-time report on a work queue: how much is done/queued/running/
+    failed overall and per job type, how fast `done` jobs are landing, and a
+    rough ETA for the rest - the same numbers `import-all`'s own 15s progress
+    log prints, but on demand and without needing a foreground
+    `import-all`/`serve` of your own running.
+
+    Defaults to asana_migration's own queue (./var/jobs.json). Pass
+    `--padmasana` to report on padmasana_migration's queue
+    (./var/padmasana_jobs.json) instead - the two never share a queue file
+    (see padmasana_migration/config.py), so this is a straight either/or."""
+    import collections
+
+    if args.padmasana:
+        from padmasana_migration.config import JOBS_PATH
+    else:
+        from .config import JOBS_PATH
+    from .jobs import JobQueue
+
+    queue = JobQueue(path=JOBS_PATH)
+    jobs = queue.all_jobs()
+    if not jobs:
+        hint = ("run one of padmasana_migration's scripts (e.g. `padmasana-build-tasks`) first"
+                 if args.padmasana else "run `import-all` or `serve` first")
+        print(f"No jobs in {JOBS_PATH} yet - nothing has been queued ({hint}).")
+        return
+
+    now = time.time()
+    total = len(jobs)
+    by_status = collections.Counter(j.status for j in jobs)
+    done_jobs = [j for j in jobs if j.status == "done"]
+    done_n = by_status["done"]
+    queued_n = by_status["queued"]
+    running_n = by_status["running"]
+    error_n = by_status["error"]
+    remaining = queued_n + running_n
+
+    started = [j.started_at for j in jobs if j.started_at]
+    elapsed_min = (now - min(started)) / 60 if started else 0.0
+    overall_rate = done_n / elapsed_min if elapsed_min > 0 else 0.0
+
+    window_min = max(0.1, args.window)
+    window_sec = window_min * 60
+    recent_done_n = sum(1 for j in done_jobs if j.started_at and now - j.started_at <= window_sec)
+    recent_rate = recent_done_n / window_min
+
+    eta_rate = recent_rate or overall_rate
+    eta_min = remaining / eta_rate if eta_rate > 0 else None
+
+    print(f"Job queue: {JOBS_PATH}  (checked {time.strftime('%Y-%m-%d %H:%M:%S %Z')})")
+    print(f"Running for: {elapsed_min:.1f} min\n")
+
+    print(_progress_bar(done_n, total), f" {done_n}/{total} done, {remaining} left")
+    print(f"  done: {done_n:>6}   queued: {queued_n:>6}   running: {running_n:>6}   error: {error_n:>6}\n")
+
+    print("Save rate:")
+    print(f"  overall:        {overall_rate:7.1f} jobs/min  ({overall_rate / 60:.2f}/sec)  since it started")
+    print(f"  last {window_min:g} min:    {recent_rate:7.1f} jobs/min  ({recent_done_n} job(s) in the window)")
+    if eta_min is not None:
+        eta_when = time.strftime("%H:%M:%S", time.localtime(now + eta_min * 60))
+        print(f"\nETA: ~{eta_min:.1f} min left at the {'recent' if recent_rate else 'overall'} rate "
+              f"(finish around {eta_when})")
+    else:
+        print("\nETA: n/a (no completed jobs yet)")
+
+    print("\nBy type:")
+    types = sorted({j.type for j in jobs})
+    header = f"  {'type':<26}{'done':>8}{'queued':>8}{'running':>9}{'error':>8}{'total':>8}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for t in types:
+        t_jobs = [j for j in jobs if j.type == t]
+        c = collections.Counter(j.status for j in t_jobs)
+        print(f"  {t:<26}{c['done']:>8}{c['queued']:>8}{c['running']:>9}{c['error']:>8}{len(t_jobs):>8}")
+
+    if error_n:
+        print(f"\n{error_n} job(s) failed permanently. See `retry-attachments` for attachment downloads, "
+              "or re-run `import-all`/`import` for the rest.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="asana-migration")
     sub = parser.add_subparsers(dest="command")
@@ -579,6 +675,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     estimate_storage.set_defaults(func=_cmd_estimate_storage)
 
+    job_status = sub.add_parser(
+        "job-status",
+        help="Report on a job queue: done/queued/running/error counts, save rate, ETA, and a "
+             "per-type breakdown - reads the queue file only, no Asana call, no token.",
+    )
+    job_status.add_argument("--window", type=float, default=5.0, metavar="MINUTES",
+                             help="Window (in minutes) for the recent-rate/ETA calculation (default 5).")
+    job_status.add_argument("--padmasana", action="store_true",
+                             help="Report on padmasana_migration's queue (./var/padmasana_jobs.json) "
+                                  "instead of asana_migration's own (./var/jobs.json, the default).")
+    job_status.set_defaults(func=_cmd_job_status)
+
     return parser
 
 
@@ -614,6 +722,11 @@ def estimate_storage_main() -> None:
 def retry_attachments_main() -> None:
     """Console-script entry point for `retry-attachments` (and `uv run retry-attachments`)."""
     main(["retry-attachments", *sys.argv[1:]])
+
+
+def job_status_main() -> None:
+    """Console-script entry point for `job-status` (and `uv run job-status`)."""
+    main(["job-status", *sys.argv[1:]])
 
 
 if __name__ == "__main__":

@@ -19,6 +19,11 @@ import-all = "asana_migration.main:import_all_main"
 download-attachments = "asana_migration.main:download_attachments_main"
 retry-attachments = "asana_migration.main:retry_attachments_main"
 estimate-storage = "asana_migration.main:estimate_storage_main"
+padmasana-migration = "padmasana_migration.main:main"
+padmasana-build-teams-and-boards = "padmasana_migration.main:build_teams_and_boards_main"
+padmasana-upload-attachments = "padmasana_migration.main:upload_attachments_main"
+padmasana-build-tasks = "padmasana_migration.main:build_tasks_main"
+job-status = "asana_migration.main:job_status_main"
 
 [build-system]
 requires = ["uv_build>=0.12.4,<0.13.0"]

@@ -165,6 +165,15 @@ class JobQueue:
                 out[job.status] = out.get(job.status, 0) + 1
             return out
 
+    def all_jobs(self) -> list[Job]:
+        """A read-only snapshot of every job, id-ordered - for reporting
+        (e.g. `job-status`) that needs more than the aggregate counts
+        `stats()`/`stats_for()` give, like per-type breakdowns or throughput
+        derived from each job's `started_at`."""
+        with self._locked():
+            jobs = self._load()
+            return sorted(jobs.values(), key=lambda j: j.id)
+
     def pending_count_for(self, predicate) -> int:
         with self._locked():
             jobs = self._load()
