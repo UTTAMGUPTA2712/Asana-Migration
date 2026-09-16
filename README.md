@@ -167,6 +167,42 @@ file transfer itself isn't an api.asana.com call and doesn't count against
 Asana's limit at all — see **Rate limiting** below). `--token` and `-v` work
 the same as `import-all`.
 
+## Retrying attachments that failed permanently
+
+`download-attachments` gives each attachment up to 5 attempts (with backoff)
+before marking it permanently `error` in the job queue and moving on. That's
+a blunt, one-size-fits-all policy - a fixed 30s timeout shared with ordinary
+JSON API calls, no real backoff logic of its own beyond the queue's - so a
+big or slow-to-fetch file can exhaust all 5 attempts the same way every time
+while everything else downloads fine.
+
+```bash
+uv run retry-attachments
+```
+
+This targets *only* those already-failed downloads and gives each one a more
+forgiving retry: a bigger, configurable timeout (120s by default), its own
+backoff loop (separate from, and on top of, the original 5 attempts), and
+bounded concurrency. A successful retry is folded back into the normal state
+exactly like `download-attachments` would (`attachments.json` gets its
+`local_path`/`downloaded_at`, the job is marked `done`). If nothing is
+currently failed, it says so and exits without even asking for a token.
+
+Anything that still fails after that gets written to a report -
+`var/attachment_retry_failures_<timestamp>.json` - naming the task, the
+attachment, and a classified reason (deleted/forbidden on Asana, timed out,
+network error, local disk error, …) instead of leaving you to grep logs.
+
+Useful flags: `--retries N` (default 4), `--timeout SECONDS` (default 120),
+`--concurrency N` (default 6), `--rate-limit`, `--token`, `-v` — same idea as
+`download-attachments`'s flags, just scoped to the failed subset and with
+more forgiving defaults.
+
+Also available as a standalone script if you'd rather point it at a
+`data/`/`var/` pair that isn't `./data`/`./var` without an env var: `uv run
+python scripts/retry_failed_attachments.py --data-dir /path/to/data --var-dir
+/path/to/var` - same logic underneath.
+
 ## Checking how much disk space attachments need
 
 ```bash
@@ -222,7 +258,7 @@ docker compose up -d --build
 on its own after a rebuild/recreate (`restart: unless-stopped` + baked into
 the image's `CMD`).
 
-For `import-all`, `download-attachments`, `estimate-storage`, or anything
+For `import-all`, `download-attachments`, `retry-attachments`, `estimate-storage`, or anything
 else, open a shell in the same running container - it runs safely alongside
 the auto-started `serve`, sharing the same mounted `data/`/`var/` (the job
 queue is safe for concurrent access):
@@ -231,6 +267,7 @@ queue is safe for concurrent access):
 docker compose exec asana-migration bash
 import-all
 download-attachments
+retry-attachments
 estimate-storage
 ```
 

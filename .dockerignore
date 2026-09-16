@@ -1,6 +1,6 @@
 .venv
 var
-data
+/data*
 .git
 .gitignore
 __pycache__

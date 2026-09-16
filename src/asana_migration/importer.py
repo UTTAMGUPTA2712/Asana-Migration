@@ -20,11 +20,15 @@ is fetched exactly once no matter how many places reference it.
 from __future__ import annotations
 
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
-from .client import AsanaClient
-from .jobs import JobQueue
+import requests
+
+from .client import AsanaApiError, AsanaAuthError, AsanaClient
+from .jobs import Job, JobQueue
 from .storage import AttachmentsFile, Meta, Paths, TaskIndex, now_iso, read_json, safe_filename, write_bytes, write_json
 
 log = logging.getLogger("asana_migration.importer")
@@ -479,6 +483,124 @@ def queue_pending_attachment_downloads(ctx: ImporterContext) -> tuple[int, int]:
             if job:
                 queued += 1
     return queued, already_done
+
+
+# Per-attempt wait when retrying a previously-failed download (see
+# `retry_failed_attachment_downloads` below) - held at its last value beyond
+# the 4th attempt rather than growing unbounded.
+RETRY_BACKOFF_SECONDS = (5, 15, 30, 60)
+
+
+@dataclass
+class AttachmentRetryFailure:
+    """One attachment that still couldn't be downloaded after its own extra
+    retries - everything the `retry-attachments` CLI command needs to
+    report why, without the caller re-deriving it from a raw exception."""
+    job_id: int
+    workspace_dir: str
+    task_gid: str
+    task_name: str | None
+    attachment_gid: str
+    attachment_name: str | None
+    attachment_size: int | None
+    attempts_made: int
+    reason: str
+    last_error: str
+
+
+def classify_attachment_download_error(exc: Exception, timeout: float) -> str:
+    """Turns a raw exception from a failed download attempt into a short,
+    human-readable reason - the whole point of the report
+    `retry_failed_attachment_downloads` produces over just re-reading logs."""
+    if isinstance(exc, AsanaAuthError):
+        return "Asana rejected the access token (401) - it's expired or been revoked; fix the token and retry."
+    if isinstance(exc, AsanaApiError):
+        msg = str(exc)
+        if "-> 404:" in msg:
+            return f"attachment no longer exists on Asana (404) - likely deleted since it was first listed: {msg}"
+        if "-> 403:" in msg:
+            return f"access denied by Asana (403) - permissions on the task/attachment may have changed: {msg}"
+        if "rate limited too many times" in msg:
+            return f"kept getting rate-limited (429) even after the client's own retries: {msg}"
+        if "returned 5" in msg:
+            return f"Asana's API kept returning server errors (5xx): {msg}"
+        return f"Asana API error: {msg}"
+    if isinstance(exc, requests.exceptions.Timeout):
+        return f"download timed out after {timeout:.0f}s each attempt - file is likely large or the network too slow"
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return f"network/connection error while downloading: {exc}"
+    if isinstance(exc, requests.exceptions.HTTPError):
+        return f"the file host rejected the request: {exc}"
+    if isinstance(exc, OSError):
+        return f"local disk error while saving the file (check permissions/free space): {exc}"
+    return f"unexpected error: {exc}"
+
+
+def _retry_one_attachment(ctx: ImporterContext, job: Job, retries: int, timeout: float) -> AttachmentRetryFailure | None:
+    """Runs `h_download_task_attachment` up to `retries` times with backoff
+    (`RETRY_BACKOFF_SECONDS`) for one already-failed job. Returns None on
+    success (and marks the job `done`, same as a normal successful download),
+    or an `AttachmentRetryFailure` describing why it still didn't land."""
+    last_exc: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            h_download_task_attachment(ctx, job.payload)
+            ctx.queue.complete(job.id)
+            return None
+        except Exception as exc:  # noqa: BLE001 - classified and reported by the caller
+            last_exc = exc
+            log.warning("job %s attachment %s: attempt %d/%d failed: %s",
+                        job.id, job.payload.get("attachment_gid"), attempt, retries, exc)
+            if attempt < retries:
+                time.sleep(RETRY_BACKOFF_SECONDS[min(attempt - 1, len(RETRY_BACKOFF_SECONDS) - 1)])
+
+    payload = job.payload
+    task_dir = ctx.paths.task_dir(Path(payload["workspace_dir"]), payload["task_gid"])
+    task = read_json(task_dir / "task.json", default={}) or {}
+    attachment = next(
+        (a for a in AttachmentsFile(task_dir).read() if a.get("gid") == payload["attachment_gid"]),
+        {},
+    )
+    return AttachmentRetryFailure(
+        job_id=job.id,
+        workspace_dir=payload["workspace_dir"],
+        task_gid=payload["task_gid"],
+        task_name=task.get("name"),
+        attachment_gid=payload["attachment_gid"],
+        attachment_name=attachment.get("name"),
+        attachment_size=attachment.get("size"),
+        attempts_made=retries,
+        reason=classify_attachment_download_error(last_exc, timeout),
+        last_error=str(last_exc),
+    )
+
+
+def find_failed_attachment_downloads(queue: JobQueue) -> list[Job]:
+    return queue.errors_for(lambda j: j.type == "download_task_attachment")
+
+
+def retry_failed_attachment_downloads(
+    ctx: ImporterContext, failed_jobs: list[Job], *, retries: int, timeout: float, concurrency: int,
+) -> tuple[int, list[AttachmentRetryFailure]]:
+    """Gives every already-`error`'d `download_task_attachment` job its own
+    tighter retry - a bigger/configurable timeout and real backoff per
+    attachment (see `_retry_one_attachment`), rather than the queue's blunt
+    5-attempts-with-a-fixed-30s-timeout policy `download-attachments` uses.
+    Bounded concurrency, same bandwidth-bound rationale as `download-
+    attachments`'s `--concurrency` (see that command's docstring in main.py).
+
+    Returns (number recovered, still-failing attachments with a reason
+    each) - callers decide what to do with the failures (the `retry-
+    attachments` CLI command writes them to a JSON report)."""
+    succeeded = 0
+    failures: list[AttachmentRetryFailure] = []
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        for result in pool.map(lambda job: _retry_one_attachment(ctx, job, retries, timeout), failed_jobs):
+            if result is None:
+                succeeded += 1
+            else:
+                failures.append(result)
+    return succeeded, failures
 
 
 def estimate_attachment_storage(paths: Paths) -> dict:
