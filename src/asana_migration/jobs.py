@@ -111,6 +111,36 @@ class JobQueue:
             self._save(jobs)
             return job
 
+    def push_many(self, items: list[tuple[str, dict, str | None]]) -> int:
+        """Bulk `push()` for queueing many jobs at once (e.g. one per task
+        found on disk). `push()` loads, dedupe-scans, and saves the *whole*
+        jobs file on every single call - fine at the rate real work pushes
+        new jobs, but O(n^2) and silent (no work happens between calls, so
+        nothing gets logged) when a caller loops it thousands of times in a
+        row. This does the load/dedupe-scan/save once for the entire batch.
+        `items` is a list of (type, payload, dedupe_key); same dedupe_key
+        rules as `push()` (`force` isn't supported here - no bulk caller
+        needs it). Returns how many were actually added."""
+        with self._locked():
+            jobs = self._load()
+            existing_keys = {
+                j.dedupe_key for j in jobs.values()
+                if j.dedupe_key and j.status in ("queued", "running", "done")
+            }
+            next_id = max((j.id for j in jobs.values()), default=0) + 1
+            added = 0
+            for type_, payload, dedupe_key in items:
+                if dedupe_key and dedupe_key in existing_keys:
+                    continue
+                jobs[next_id] = Job(id=next_id, type=type_, payload=payload, dedupe_key=dedupe_key)
+                if dedupe_key:
+                    existing_keys.add(dedupe_key)
+                next_id += 1
+                added += 1
+            if added:
+                self._save(jobs)
+            return added
+
     def pop_next(self) -> Job | None:
         with self._locked():
             jobs = self._load()

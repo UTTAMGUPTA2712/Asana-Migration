@@ -138,6 +138,7 @@ def h_build_task_pass1(ctx: BuildContext, payload: dict) -> None:
         "uuid": task_uuid,
         "name": task.get("name"),
         "description": task.get("notes") or "",
+        "description_html": task.get("html_notes") or "",
         "assignee_email": assignee_email,
         "created_at": task.get("created_at"),
         "due_date": task.get("due_on") or ((task.get("due_at") or "")[:10] or None),
@@ -319,20 +320,37 @@ def _uploaded_attachments_path(build_dir: Path, task_gid: str) -> Path:
 # --- queueing / pass 2 / compile -------------------------------------------
 
 def queue_pass1_jobs(data_paths: Paths, queue: JobQueue) -> int:
-    queued = 0
-    for task_dir in iter_all_task_dirs(data_paths):
-        task_gid = task_dir.name.split("_", 1)[0]
-        job = queue.push("build_task_pass1", {"task_gid": task_gid}, dedupe_key=f"build_task:{task_gid}")
-        if job:
-            queued += 1
-    return queued
+    # One `push_many()` call for the whole batch, not one `push()` per task:
+    # `push()` re-reads/re-writes the entire (ever-growing) jobs file on
+    # every call, so looping it over thousands of tasks is O(n^2) and, since
+    # no work actually happens between calls, produces no log output for
+    # however long that takes - it looks hung even though it isn't.
+    items = [
+        ("build_task_pass1", {"task_gid": task_dir.name.split("_", 1)[0]}, f"build_task:{task_dir.name.split('_', 1)[0]}")
+        for task_dir in iter_all_task_dirs(data_paths)
+    ]
+    log.info("Found %d task(s) on disk, queueing...", len(items))
+    return queue.push_many(items)
+
+
+def _gid_to_uuid_path(build_dir: Path) -> Path:
+    return build_dir / "gid_to_uuid.json"
 
 
 def run_pass2(build_dir: Path) -> tuple[int, int]:
     """Level-by-level isn't needed here the way it is in §10's live seeder -
     every task's own `uuid` already exists on disk by the time pass 2 runs
     (pass 1's queue has fully drained), so a single sweep resolves every
-    `parent_task_uuid` in one pass, regardless of how deep the tree goes."""
+    `parent_task_uuid` in one pass, regardless of how deep the tree goes.
+
+    That single sweep still has to open every task.json once to learn its
+    `uuid` - unavoidable, it's the only place that mapping lives - but the
+    result is written out to `gid_to_uuid.json` right away rather than kept
+    only as an in-memory dict that's thrown away when this function
+    returns. That gives anything downstream that needs "asana gid -> our
+    uuid" for a parent (or any other task) lookup a small file to read
+    instead of re-scanning every task.json (each one carrying comments,
+    tags, etc.) just to get at two fields."""
     tasks_dir = build_dir / "tasks"
     if not tasks_dir.exists():
         return 0, 0
@@ -345,6 +363,8 @@ def run_pass2(build_dir: Path) -> tuple[int, int]:
             continue
         task_paths.append(task_json_path)
         uuid_by_asana_gid[task["asana_gid"]] = task["uuid"]
+
+    write_json(_gid_to_uuid_path(build_dir), uuid_by_asana_gid)
 
     patched = missing = 0
     for task_json_path in task_paths:

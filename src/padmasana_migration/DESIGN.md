@@ -488,7 +488,8 @@ joins against (`section_task`, `task_tag`, `task_collaborator`,
 | Asana field | padmasana column | Notes |
 |---|---|---|
 | `name` | `name` | |
-| `notes` (plain) | `description` | `html_notes` is not used — padmasana's `description` is plain text |
+| `notes` (plain) | `description` | |
+| `html_notes` | `description_html` | carried through alongside plain `description`, same as a comment's `text`/`html_text` pair (§5.8) |
 | `assignee.email` | `assignee_id` | a serial int FK (§5.2); build JSON stores the assignee's `email`, §10 resolves `email → id`; `null` stays `null` |
 | `created_at` | `created_at` | |
 | `due_on` / `due_at` | `due_date` | `due_date` is a bare `date` column — `due_at`'s time-of-day is dropped if only it's set |
