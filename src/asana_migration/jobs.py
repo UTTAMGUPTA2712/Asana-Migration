@@ -198,6 +198,47 @@ class JobQueue:
             jobs = self._load()
             return [j for j in jobs.values() if j.status == "error" and predicate(j)]
 
+    def resolve_superseded_errors(self, predicate) -> list[Job]:
+        """Finds every permanently-failed (`error`) job matching `predicate`
+        whose `dedupe_key` already has a *different* job that's `queued`,
+        `running`, or `done` - meaning some later push already created a
+        fresh job for the same work (see `push()`'s docstring: an `error`
+        status never blocks a new push, on purpose, so one failure can't
+        wedge a dedupe key forever) and that fresh job has since succeeded
+        or is in flight. That leaves the original behind as a permanent
+        orphan: nothing ever revisits it (there's no pruning for `error`
+        rows, only `prune_done`), so it just sits there claiming the same
+        work is still broken - inflating `job-status`'s error count and
+        `retry-all`'s "still failing" report for something that isn't
+        actually still failing.
+
+        Marks each one `done` instead of leaving it `error` (its work
+        really is done, just under a different job id), noting which job
+        superseded it in `error` for traceability. Must run before
+        `requeue_errors`/any retry pass, so a stale orphan doesn't get
+        resurrected and have its already-finished work redundantly redone.
+        Returns the resolved jobs, for the caller to log."""
+        with self._locked():
+            jobs = self._load()
+            by_key: dict[str, list[Job]] = {}
+            for job in jobs.values():
+                if job.dedupe_key:
+                    by_key.setdefault(job.dedupe_key, []).append(job)
+            resolved = []
+            for job in jobs.values():
+                if job.status != "error" or not job.dedupe_key or not predicate(job):
+                    continue
+                newer = [j for j in by_key[job.dedupe_key]
+                         if j.id != job.id and j.status in ("queued", "running", "done")]
+                if newer:
+                    superseded_by = max(newer, key=lambda j: j.id)
+                    job.status = "done"
+                    job.error = f"superseded: job #{superseded_by.id} ({superseded_by.status}) already covers this work"
+                    resolved.append(job)
+            if resolved:
+                self._save(jobs)
+            return resolved
+
     def requeue_errors(self, predicate) -> int:
         """Resets every permanently-failed (`status == "error"`) job matching
         `predicate` back to `queued` with a fresh attempt budget, so the
@@ -207,7 +248,9 @@ class JobQueue:
         `retry_failed_attachment_downloads`, which bypasses the queue
         entirely instead so it can use its own timeout/concurrency); they
         just need another shot through the queue they already came from.
-        Returns how many jobs were requeued."""
+        Call `resolve_superseded_errors` first - this requeues whatever
+        `error` jobs remain unconditionally, with no dedupe-key awareness
+        of its own. Returns how many jobs were requeued."""
         with self._locked():
             jobs = self._load()
             n = 0

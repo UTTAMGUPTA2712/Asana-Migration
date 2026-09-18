@@ -498,12 +498,24 @@ def _cmd_retry_all_failed(args: argparse.Namespace) -> None:
     # there's no point prompting for credentials for a no-op.
     queue = JobQueue()
     paths = Paths()
+
+    # Resolve stale orphans first (an `error` job whose dedupe_key already
+    # has a newer done/queued/running job - see resolve_superseded_errors's
+    # docstring) - before collecting anything below, so neither the "still
+    # failing" counts nor the actual retry passes ever see or redo work
+    # that's already finished under a different job id.
+    resolved = (queue.resolve_superseded_errors(lambda j: not is_attachment(j))
+                + queue.resolve_superseded_errors(is_attachment))
+    if resolved:
+        log.info("%d job(s) were already fixed by a newer job that finished the same work - "
+                  "marked done instead of retrying them again.", len(resolved))
+
     other_error_jobs = queue.errors_for(lambda j: not is_attachment(j))
     failed_attachments = find_failed_attachment_downloads(queue)
     stuck_attachments = find_stuck_attachment_downloads(paths, queue)
     attachment_jobs = failed_attachments + stuck_attachments
     if not other_error_jobs and not attachment_jobs:
-        log.info("Nothing permanently-failed or stuck of any job type - nothing to retry.")
+        log.info("Nothing left to retry%s.", " after that" if resolved else "")
         return
     log.info("%d non-attachment job(s) failed permanently, %d attachment download(s) failed or stuck - retrying both.",
               len(other_error_jobs), len(attachment_jobs))
