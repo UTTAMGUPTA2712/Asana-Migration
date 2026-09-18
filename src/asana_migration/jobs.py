@@ -197,3 +197,26 @@ class JobQueue:
         with self._locked():
             jobs = self._load()
             return [j for j in jobs.values() if j.status == "error" and predicate(j)]
+
+    def requeue_errors(self, predicate) -> int:
+        """Resets every permanently-failed (`status == "error"`) job matching
+        `predicate` back to `queued` with a fresh attempt budget, so the
+        normal worker pool picks it up again. Used by `retry-all` for
+        non-attachment job types - those don't need their own retry loop
+        the way `download_task_attachment` does (see
+        `retry_failed_attachment_downloads`, which bypasses the queue
+        entirely instead so it can use its own timeout/concurrency); they
+        just need another shot through the queue they already came from.
+        Returns how many jobs were requeued."""
+        with self._locked():
+            jobs = self._load()
+            n = 0
+            for job in jobs.values():
+                if job.status == "error" and predicate(job):
+                    job.status = "queued"
+                    job.attempts = 0
+                    job.error = None
+                    job.not_before = 0.0
+                    n += 1
+            self._save(jobs)
+            return n

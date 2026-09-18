@@ -167,36 +167,49 @@ file transfer itself isn't an api.asana.com call and doesn't count against
 Asana's limit at all — see **Rate limiting** below). `--token` and `-v` work
 the same as `import-all`.
 
-## Retrying attachments that failed permanently
+## Retrying jobs that failed permanently
 
-`download-attachments` gives each attachment up to 5 attempts (with backoff)
-before marking it permanently `error` in the job queue and moving on. That's
-a blunt, one-size-fits-all policy - a fixed 30s timeout shared with ordinary
-JSON API calls, no real backoff logic of its own beyond the queue's - so a
-big or slow-to-fetch file can exhaust all 5 attempts the same way every time
-while everything else downloads fine.
+Any job type can end up permanently `error` after 5 attempts - a project/task/
+comment fetch that kept 500ing, or an attachment download that kept timing
+out. `download-attachments` in particular gives each attachment up to 5
+attempts (with backoff) against a blunt, one-size-fits-all policy - a fixed
+30s timeout shared with ordinary JSON API calls, no real backoff logic of its
+own beyond the queue's - so a big or slow-to-fetch file can exhaust all 5
+attempts the same way every time while everything else downloads fine.
 
 ```bash
-uv run retry-attachments
+uv run retry-all
 ```
 
-This targets *only* those already-failed downloads and gives each one a more
-forgiving retry: a bigger, configurable timeout (120s by default), its own
-backoff loop (separate from, and on top of, the original 5 attempts), and
-bounded concurrency. A successful retry is folded back into the normal state
-exactly like `download-attachments` would (`attachments.json` gets its
-`local_path`/`downloaded_at`, the job is marked `done`). If nothing is
-currently failed, it says so and exits without even asking for a token.
+This retries *every* permanently-failed job, not just attachments - but not
+with one blanket policy, since attachment downloads genuinely need different
+treatment (bandwidth-bound file transfers vs. fast JSON calls). It does two
+things, back to back:
 
-Anything that still fails after that gets written to a report -
-`var/attachment_retry_failures_<timestamp>.json` - naming the task, the
-attachment, and a classified reason (deleted/forbidden on Asana, timed out,
-network error, local disk error, …) instead of leaving you to grep logs.
+- Every other failed job type (project/task/section/comment fetches, ...) is
+  requeued and drained through the same rate-limited worker pool `import-all`
+  uses - equivalent to just re-running `import-all` for its retry-failed-jobs
+  side effect, bundled in here for convenience.
+- Attachment downloads get their own more forgiving pass: a bigger,
+  configurable timeout (120s by default), its own backoff loop (separate
+  from, and on top of, the original 5 attempts), and bounded concurrency.
+  This also catches ones marked `done` but never actually saved to disk, not
+  just ones marked `error`. A successful retry is folded back into the normal
+  state exactly like `download-attachments` would (`attachments.json` gets
+  its `local_path`/`downloaded_at`, the job is marked `done`).
+
+If nothing has failed at all, it says so and exits without even asking for a
+token. Anything still failing afterward gets written to a report so you're
+not left grepping logs: `var/job_retry_failures_<timestamp>.json` (id, type,
+payload, reason) for non-attachment jobs, and
+`var/attachment_retry_failures_<timestamp>.json` (task, attachment, and a
+classified reason - deleted/forbidden on Asana, timed out, network error,
+local disk error, …) for attachments.
 
 Useful flags: `--retries N` (default 4), `--timeout SECONDS` (default 120),
-`--concurrency N` (default 6), `--rate-limit`, `--token`, `-v` — same idea as
-`download-attachments`'s flags, just scoped to the failed subset and with
-more forgiving defaults.
+`--concurrency N` (default 6), `--rate-limit`, `--token`, `-v` — the first
+three apply to the attachment pass specifically (non-attachment jobs use the
+queue's own fixed 5-attempt policy); the rest apply to both passes.
 
 Also available as a standalone script if you'd rather point it at a
 `data/`/`var/` pair that isn't `./data`/`./var` without an env var: `uv run
@@ -301,7 +314,7 @@ docker compose up -d --build
 on its own after a rebuild/recreate (`restart: unless-stopped` + baked into
 the image's `CMD`).
 
-For `import-all`, `download-attachments`, `retry-attachments`, `estimate-storage`,
+For `import-all`, `download-attachments`, `retry-all`, `estimate-storage`,
 `job-status`, or anything else, open a shell in the same running container -
 it runs safely alongside the auto-started `serve`, sharing the same mounted
 `data/`/`var/` (the job queue is safe for concurrent access):
@@ -310,7 +323,7 @@ it runs safely alongside the auto-started `serve`, sharing the same mounted
 docker compose exec asana-migration bash
 import-all
 download-attachments
-retry-attachments
+retry-all
 estimate-storage
 job-status
 ```

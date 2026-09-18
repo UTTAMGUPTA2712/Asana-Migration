@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Thin standalone wrapper for `asana-migration retry-attachments`.
+"""Thin standalone wrapper for the attachment-only retry pass (a subset of
+what `asana-migration retry-all` does).
 
 Kept as a plain script (like `estimate_attachment_storage.py`) for anyone
 who wants to point it at a `data/`/`var/` pair that isn't `./data`/`./var`
 without juggling env vars by hand, or run it without the package's console
 scripts installed at all. The actual logic lives in
 `asana_migration.importer.retry_failed_attachment_downloads` - see that
-docstring, and the `retry-attachments` CLI command in main.py, for details
-on why this needs its own pass instead of just re-running
+docstring, and the `retry-all` CLI command in main.py (specifically
+`_cmd_retry_failed_attachments`, its attachment-only building block), for
+details on why this needs its own pass instead of just re-running
 `download-attachments` again.
 
 Usage:

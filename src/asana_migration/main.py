@@ -50,7 +50,7 @@ log = logging.getLogger("asana_migration.import_all")
 # it's conservative-but-raisable rather than derived from anything.
 DEFAULT_DOWNLOAD_CONCURRENCY = 12
 
-# Defaults for `retry-attachments` - gentler/more forgiving than
+# Defaults for `retry-all`'s attachment pass - gentler/more forgiving than
 # download-attachments' own retry policy on purpose, since these attachments
 # already exhausted that one. See `_cmd_retry_failed_attachments`.
 DEFAULT_RETRY_CONCURRENCY = 6
@@ -455,6 +455,153 @@ def _cmd_retry_failed_attachments(args: argparse.Namespace) -> None:
         log.info("Everything that had failed before is now downloaded.")
 
 
+def _cmd_retry_all_failed(args: argparse.Namespace) -> None:
+    """Backs the `retry-all` CLI command. Retries every permanently-
+    failed job, of every type, in one command - without collapsing them into
+    one retry policy. `download_task_attachment` jobs are bandwidth-bound
+    file transfers that need their own bigger timeout, fixed concurrency and
+    stuck-file detection (see `_cmd_retry_failed_attachments`'s docstring for
+    why - that function still exists standalone for `scripts/
+    retry_failed_attachments.py`, which calls it directly rather than going
+    through this one); every other job type is a fast JSON call that's
+    already well served by the normal rate-limited worker pool - the same
+    one `import-all` uses - and just needs to be put back in the queue. So
+    this does both, back to back: requeue+drain the non-attachment failures
+    through the ordinary pool, then hand attachment failures to the existing
+    tuned attachment-retry path. Equivalent to running `import-all` (for its
+    retry-permanently-failed-jobs side effect) followed by the old
+    attachment-only retry, just in one command with one token prompt."""
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)-7s [%(threadName)s] %(name)s: %(message)s",
+    )
+    if not args.verbose:
+        logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+    from . import config as config_mod
+    from .client import AsanaAuthError, AsanaClient
+    from .importer import (
+        ImporterContext,
+        find_failed_attachment_downloads,
+        find_stuck_attachment_downloads,
+        retry_failed_attachment_downloads,
+    )
+    from .jobs import JobQueue
+    from .rate_limiter import RateLimiter
+    from .worker import WorkerPool, desired_worker_count
+    from .storage import Paths
+
+    is_attachment = lambda j: j.type == "download_task_attachment"  # noqa: E731
+
+    # Checked before asking for a token at all, same as
+    # _cmd_retry_failed_attachments - this only reads jobs.json and disk, and
+    # there's no point prompting for credentials for a no-op.
+    queue = JobQueue()
+    paths = Paths()
+    other_error_jobs = queue.errors_for(lambda j: not is_attachment(j))
+    failed_attachments = find_failed_attachment_downloads(queue)
+    stuck_attachments = find_stuck_attachment_downloads(paths, queue)
+    attachment_jobs = failed_attachments + stuck_attachments
+    if not other_error_jobs and not attachment_jobs:
+        log.info("Nothing permanently-failed or stuck of any job type - nothing to retry.")
+        return
+    log.info("%d non-attachment job(s) failed permanently, %d attachment download(s) failed or stuck - retrying both.",
+              len(other_error_jobs), len(attachment_jobs))
+
+    cfg = config_mod.load_config()
+    token = args.token or cfg.token
+    if not token:
+        token = getpass.getpass("Asana personal access token: ").strip()
+    if not token:
+        log.error("No token provided. Pass --token, or run once with the token to save it.")
+        raise SystemExit(1)
+
+    rate_limit = args.rate_limit or cfg.rate_limit_per_minute
+    rate_limiter = RateLimiter(rate_limit)
+    # One quick auth check up front covers both phases below - no need to
+    # repeat it per-client, since both share the same token/rate_limiter.
+    client = AsanaClient(token, rate_limiter)
+    try:
+        client.get_me()
+    except AsanaAuthError as exc:
+        log.error("%s", exc)
+        raise SystemExit(1)
+
+    # --- Phase 1: non-attachment jobs - requeue and drain with the normal
+    # rate-limited worker pool, exactly like import-all does for jobs that
+    # failed permanently on an earlier run. ---
+    if other_error_jobs:
+        # Snapshot which job ids were failing before this pass, right before
+        # requeuing them - so "recovered" below can be computed as a set
+        # difference against those specific ids, not a raw subtraction. A
+        # requeued job that succeeds can spawn brand-new child jobs (e.g.
+        # import_project -> import_sections/import_task), and if one of
+        # *those* fails permanently during this same run it inflates the
+        # post-drain error count without ever having been part of `n` -
+        # `n - stats["error"]` could then go negative or just misreport.
+        original_ids = {j.id for j in other_error_jobs}
+        ctx = ImporterContext(client=client, paths=paths, queue=queue, max_subtask_depth=cfg.max_subtask_depth)
+        n = queue.requeue_errors(lambda j: not is_attachment(j))
+        num_workers = desired_worker_count(rate_limit)
+        log.info("=== Retrying %d non-attachment job(s) with %d worker(s) (~%d req/min each) ===",
+                  n, num_workers, rate_limit // max(1, num_workers))
+        start = time.monotonic()
+        pool = WorkerPool(ctx)
+        pool.start(rate_limit)
+        try:
+            while True:
+                stats = queue.stats_for(lambda j: not is_attachment(j))
+                if stats["queued"] == 0 and stats["running"] == 0:
+                    break
+                time.sleep(1)
+        finally:
+            pool.stop()
+        elapsed = time.monotonic() - start
+        # One read, used for both the log line and the report below, so the
+        # two can't disagree the way two separate locked queue reads could.
+        still_failing = queue.errors_for(lambda j: not is_attachment(j))
+        recovered = len(original_ids - {j.id for j in still_failing})
+        log.info("=== Done in %.1fs: %d/%d recovered, %d still failing ===",
+                  elapsed, recovered, n, len(still_failing))
+        if still_failing:
+            out_path = config_mod.VAR_DIR / f"job_retry_failures_{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.json"
+            out_path.write_text(json.dumps(
+                [{"id": j.id, "type": j.type, "payload": j.payload, "attempts": j.attempts, "error": j.error}
+                 for j in still_failing],
+                indent=2,
+            ))
+            log.warning("%d non-attachment job(s) still failing after retry - see %s for type/payload/reason per job.",
+                        len(still_failing), out_path)
+    else:
+        log.info("No non-attachment jobs had failed permanently.")
+
+    # --- Phase 2: attachment downloads - handed to the same tuned retry
+    # path `scripts/retry_failed_attachments.py` uses (own timeout, own
+    # fixed concurrency, own backoff), not the pool above. ---
+    if attachment_jobs:
+        attachment_client = AsanaClient(token, rate_limiter, timeout=args.timeout)
+        attachment_ctx = ImporterContext(client=attachment_client, paths=paths, queue=queue)
+        log.info("=== Retrying %d attachment download(s): up to %d attempt(s) each, %.0fs timeout, %d at once ===",
+                  len(attachment_jobs), args.retries, args.timeout, args.concurrency)
+        start = time.monotonic()
+        succeeded, failures = retry_failed_attachment_downloads(
+            attachment_ctx, attachment_jobs, retries=args.retries, timeout=args.timeout, concurrency=args.concurrency,
+        )
+        elapsed = time.monotonic() - start
+        log.info("=== Done in %.1fs: %d/%d attachment(s) recovered, %d still failing ===",
+                  elapsed, succeeded, len(attachment_jobs), len(failures))
+        if failures:
+            out_path = config_mod.VAR_DIR / f"attachment_retry_failures_{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.json"
+            out_path.write_text(json.dumps([asdict(f) for f in failures], indent=2))
+            log.warning("%d attachment(s) still failing after retry - see %s for gid/task/reason per file.",
+                        len(failures), out_path)
+            for f in failures:
+                log.warning("  task %s (%s): attachment %s (%s) - %s",
+                            f.task_gid, f.task_name or "?", f.attachment_gid, f.attachment_name or "?", f.reason)
+    else:
+        log.info("No attachment downloads had failed or gotten stuck.")
+
+
 def _human_bytes(n: float) -> str:
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if abs(n) < 1024:
@@ -640,8 +787,7 @@ def _cmd_job_status(args: argparse.Namespace) -> None:
                   f"out of {stats['asana_count']} Asana-hosted attachment(s)")
 
     if error_n:
-        print(f"\n{error_n} job(s) failed permanently. See `retry-attachments` for attachment downloads, "
-              "or re-run `import-all`/`import` for the rest.")
+        print(f"\n{error_n} job(s) failed permanently. Run `retry-all` to retry all of them.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -684,25 +830,27 @@ def build_parser() -> argparse.ArgumentParser:
                                        help="Log every HTTP request/download, not just the narrative summary.")
     download_attachments.set_defaults(func=_cmd_download_attachments)
 
-    retry_attachments = sub.add_parser(
-        "retry-attachments",
-        help="Retry only the attachment downloads download-attachments already gave up on permanently, "
-             "with a bigger timeout and its own backoff.",
+    retry_all = sub.add_parser(
+        "retry-all",
+        help="Retry every permanently-failed job, of every type: requeues non-attachment jobs onto the "
+             "normal rate-limited worker pool (like re-running import-all), then retries attachment "
+             "downloads separately with their own tuned timeout/concurrency/backoff.",
     )
-    retry_attachments.add_argument("--token", help="Asana personal access token (else uses the saved one, or prompts).")
-    retry_attachments.add_argument("--rate-limit", type=int, metavar="RPM",
-                                    help="Requests/minute for the one real Asana API call per attachment "
-                                         "(metadata fetch) - overrides the saved setting.")
-    retry_attachments.add_argument("--retries", type=int, default=DEFAULT_RETRY_ATTEMPTS, metavar="N",
-                                    help=f"Attempts per attachment before giving up again (default {DEFAULT_RETRY_ATTEMPTS}).")
-    retry_attachments.add_argument("--timeout", type=float, default=DEFAULT_RETRY_TIMEOUT, metavar="SECONDS",
-                                    help=f"Per-request timeout for the metadata call and the file download "
-                                         f"(default {DEFAULT_RETRY_TIMEOUT:.0f}s, vs. download-attachments' fixed 30s).")
-    retry_attachments.add_argument("--concurrency", type=int, default=DEFAULT_RETRY_CONCURRENCY, metavar="N",
-                                    help=f"How many failed attachments to retry at once (default {DEFAULT_RETRY_CONCURRENCY}).")
-    retry_attachments.add_argument("-v", "--verbose", action="store_true",
-                                    help="Log every attempt, not just the summary.")
-    retry_attachments.set_defaults(func=_cmd_retry_failed_attachments)
+    retry_all.add_argument("--token", help="Asana personal access token (else uses the saved one, or prompts).")
+    retry_all.add_argument("--rate-limit", type=int, metavar="RPM",
+                            help="Requests/minute for the non-attachment jobs and the attachment metadata "
+                                 "calls - overrides the saved setting.")
+    retry_all.add_argument("--retries", type=int, default=DEFAULT_RETRY_ATTEMPTS, metavar="N",
+                            help=f"Attempts per attachment before giving up again (default {DEFAULT_RETRY_ATTEMPTS}) "
+                                 "- non-attachment jobs use the queue's own fixed 5-attempt policy instead.")
+    retry_all.add_argument("--timeout", type=float, default=DEFAULT_RETRY_TIMEOUT, metavar="SECONDS",
+                            help=f"Per-request timeout for attachment retries specifically "
+                                 f"(default {DEFAULT_RETRY_TIMEOUT:.0f}s, vs. download-attachments' fixed 30s).")
+    retry_all.add_argument("--concurrency", type=int, default=DEFAULT_RETRY_CONCURRENCY, metavar="N",
+                            help=f"How many failed attachments to retry at once (default {DEFAULT_RETRY_CONCURRENCY}).")
+    retry_all.add_argument("-v", "--verbose", action="store_true",
+                            help="Log every HTTP request/attempt, not just the narrative summary.")
+    retry_all.set_defaults(func=_cmd_retry_all_failed)
 
     estimate_storage = sub.add_parser(
         "estimate-storage",
@@ -755,9 +903,9 @@ def estimate_storage_main() -> None:
     main(["estimate-storage", *sys.argv[1:]])
 
 
-def retry_attachments_main() -> None:
-    """Console-script entry point for `retry-attachments` (and `uv run retry-attachments`)."""
-    main(["retry-attachments", *sys.argv[1:]])
+def retry_all_main() -> None:
+    """Console-script entry point for `retry-all` (and `uv run retry-all`)."""
+    main(["retry-all", *sys.argv[1:]])
 
 
 def job_status_main() -> None:

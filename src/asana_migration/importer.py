@@ -494,8 +494,9 @@ RETRY_BACKOFF_SECONDS = (5, 15, 30, 60)
 @dataclass
 class AttachmentRetryFailure:
     """One attachment that still couldn't be downloaded after its own extra
-    retries - everything the `retry-attachments` CLI command needs to
-    report why, without the caller re-deriving it from a raw exception."""
+    retries - everything the `retry-all` CLI command (and the standalone
+    `scripts/retry_failed_attachments.py`) needs to report why, without the
+    caller re-deriving it from a raw exception."""
     job_id: int
     workspace_dir: str
     task_gid: str
@@ -635,7 +636,7 @@ def find_stuck_attachment_downloads(paths: Paths, queue: JobQueue) -> list[Job]:
     (see `h_download_task_attachment`'s docstring). Once that happens the
     job's `dedupe_key` blocks `queue_pending_attachment_downloads` from ever
     re-queuing it (see `JobQueue.push`), so without this they'd stay
-    silently un-downloaded forever - `retry-attachments` also fetches these
+    silently un-downloaded forever - `retry-all` also fetches these
     (in addition to genuine `error` jobs from `find_failed_attachment_downloads`)
     precisely so they get one more real attempt instead of vanishing. Takes
     `paths`/`queue` directly (not a full `ImporterContext`) so the CLI can
