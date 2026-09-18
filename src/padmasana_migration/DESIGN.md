@@ -1,6 +1,9 @@
 # padmasana_migration — Architecture & Data Flow
 
-Implementation status: design complete, no code written yet.
+Implementation status: scripts 1–3 (§6–§8) implemented and run end-to-end
+against a real export. `import_users.py` (§11) was added afterward, once
+it became clear a local `email → user_reference_code` mapping was worth
+having for offline sanity-checking before §10's live seed run.
 
 ## 1. Purpose
 
@@ -19,13 +22,16 @@ step (§10) that runs inside `padmasana-service`, not here.
 
 This design is built on the following as fixed facts, not open questions:
 
-- **`import-users` has already been run for this workspace.** Every
-  Asana person referenced anywhere in the export already has a real
-  identity row in padmasana — `workspace_member` (team-management),
-  `member` (board-management), `assignee` (task-management), and
-  `collaborator` (task-collaboration) — matched by `email`. This package
-  never creates identity rows; it only ever reads/validates them (at seed
-  time, see §5 and §10).
+- **`padmasana-service`'s own `import-users` CLI command has already been
+  run for this workspace.** Every Asana person referenced anywhere in the
+  export already has a real identity row in padmasana —
+  `workspace_member` (team-management), `member` (board-management),
+  `assignee` (task-management), and `collaborator` (task-collaboration) —
+  matched by `email`. This package never creates identity rows; it only
+  ever reads/validates them (at seed time, see §5 and §10). Don't confuse
+  that command with this package's own same-named `padmasana-import-users`
+  (§11) — same upstream call, but this one only reads and saves a local
+  file, it writes nothing to padmasana's database.
 - **Asana names no owner for a team and no creator for a project.**
   `team.json`/`project.json` carry only `gid`/`name`/`description`. Where
   padmasana requires one (`team.owner_id`, a migrated board's
@@ -49,7 +55,7 @@ This design is built on the following as fixed facts, not open questions:
 ```
 asana-migration/
   data/                       # Asana export — read-only from here on
-  build/                      # everything the 3 scripts below produce (gitignored, like data/ and var/)
+  build/                      # everything the scripts below produce (gitignored, like data/ and var/)
   src/
     asana_migration/          # existing: Asana -> data/
     padmasana_migration/      # this package: data/ -> build/
@@ -59,9 +65,14 @@ asana-migration/
 top-level package next to `src/asana_migration/` in the same repo, one
 `pyproject.toml`, one `uv sync`. The two packages never import from each
 other — `asana_migration` only ever talks to Asana, `padmasana_migration`
-only ever reads what `asana_migration` already exported.
+only ever reads what `asana_migration` already exported. The one
+exception is `import_users.py` (§11), which talks to padmasana's own
+identity source (the Firebase Authorization service) directly, not
+through `asana_migration` at all.
 
-Rules that hold across all three scripts:
+Rules that hold across the three core scripts (§6–§8; §11's
+`import_users.py` is a separate, later addition — see its own section for
+how it differs):
 
 - **`data/` is never modified.** Every output goes into a brand-new
   top-level folder, `build/`. If a script gets something wrong, `build/`
@@ -83,9 +94,15 @@ Rules that hold across all three scripts:
 
 | # | Script | Produces | Needs the network? |
 |---|---|---|---|
+| — | `import_users.py` (§11, optional, run any time) | `padmasana_users.json` | Yes — Firebase Authorization service only |
 | 1 | `upload_attachments.py` | `build/tasks/<gid>/attachments.json` (task-level, with file-service metadata) | Yes — file-service only |
 | 2 | `build_teams_and_boards.py` | `boards.json`, `teams.json`, `sections.json`, and the board/team pivot files | No |
 | 3 | `build_tasks.py` | `build/tasks/<gid>/*.json`, compiled into the flat files padmasana's seeders read | No |
+
+`import_users.py` has no `#` — it doesn't participate in the §8/§10
+pipeline (nothing else in `build/` depends on `padmasana_users.json`
+existing, and it depends on nothing else in `build/` either beyond
+reading whatever's already there to validate against) — see §11.
 
 Each script is independently resumable. Scripts 1 and 3 both process
 thousands of small, independent units of work (one attachment, one task)
@@ -538,6 +555,12 @@ attachments.json`, `comments.json`, `task_activity_log.json`.
   simulated run through padmasana's normal outbox/RabbitMQ pipeline
   (`modules/shared/infrastructure/database/... outbox_message` /
   `inbox_message`, §2.4 of padmasana's own HLD).
+- **`import_users.py` (§11) does not create identity rows either** —
+  despite hitting the same Firebase Authorization endpoint
+  padmasana-service's own `import-users` command does, it only reads the
+  response and saves it to a local file. Populating `workspace_member`
+  and the other identity tables stays exclusively padmasana-service's
+  job, per §2's assumption.
 
 ## 10. Loading `build/` into padmasana
 
@@ -615,3 +638,58 @@ breadth-first instead:
 `padmasana-service` repo (or point the seeders at it via an env var —
 either works, the seeder code is the same), then run `npm run seed:run --
 context <module>` once per module, in the order above.
+
+## 11. `import_users.py` — a local identity pre-check, not part of §4's pipeline
+
+§2 assumes padmasana already has an identity row for every Asana person
+this export names, resolved live at seed time (§10) — this package never
+writes those rows itself. `import_users.py` doesn't change that; it exists
+because "assume the identity rows are there" was an untestable assumption
+until this script gave it something to check against *before* a real §10
+seed run hits DESIGN.md §10's "hard error, halting the run" for a missing
+one.
+
+**What it calls.** The exact same request padmasana-service's own
+`import-users` CLI command makes
+(`modules/shared/infrastructure/cli-commands/commands/import-users.
+command.ts` → `ImportUsersOrchestrator` →
+`FirebaseAuthorizationServiceClient.importWorkspaceUsers`): a plain,
+unauthenticated `POST {FIREBASE_AUTH_API_URL}/workspace-users/import`
+against the Firebase Authorization service, body `{workspace,
+organization_unit}` — no bearer token, no session/CSRF, matching
+`HttpClient`'s own request building (`modules/shared/infrastructure/
+http/http-client.ts`), which sends no auth header at all. The response is
+normalized into the same shape `ImportUsersOrchestrator` builds from it:
+`{user_reference_code (Firebase's own `code_reference`), email, name,
+last_name, profile_url, workspace}` — `user_reference_code` is exactly
+padmasana's own `workspace_member.user_reference_code` column
+(`workspace-member.entity.ts`), the value every other identity table
+(`member`, `assignee`, `collaborator`) reuses once team-management
+resolves it by email (§10).
+
+**What it writes.**
+
+- `build/padmasana_users.json` — the normalized list above, verbatim.
+  Nothing downstream in `build/` reads this file back in — `build_tasks.py`
+  and `build_teams_and_boards.py` still only ever write `_email` fields,
+  per §5's field mappings, unchanged. It exists purely as a local
+  reference and for the validation step below.
+- Nothing else. No `workspace_member`/`member`/`assignee`/`collaborator`
+  row is created anywhere, on padmasana or otherwise (§9) — this command
+  only ever reads.
+
+**Validation.** After fetching, it scans every flat `build/*.json` file
+(the per-task `build/tasks/*/` tree is already folded into these by
+`compile_build`, §8) for any `email`/`*_email` key, and warns for any
+value with no matching `email` in the fetched user list — the exact
+condition §10's live seeder hard-errors on, caught here instead, offline,
+before that run starts. `--skip-validate` fetches and saves only.
+
+**Why it's not numbered 1/2/3 like the others (§4).** It has no place in
+the §4 pipeline's dependency order — nothing in `build/` depends on
+`padmasana_users.json` existing (scripts 1–3, §6–§8, all still run fine
+without ever calling this), and it depends on nothing scripts 1–3
+produce that it doesn't already re-read fresh each time it's run. It's
+safe to run before, after, or interleaved with any of them, as often as
+useful (e.g. re-run right before a real §10 seed to catch anyone added to
+the workspace since the last check).

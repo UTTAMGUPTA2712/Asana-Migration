@@ -1,10 +1,12 @@
-"""CLI entry points for the three scripts in DESIGN.md §4.
+"""CLI entry points for the three scripts in DESIGN.md §4, plus
+`import-users` (identity, not in DESIGN.md - see `import_users.py`).
 
+    uv run padmasana-import-users --workspace <ws> --organization-unit <ou>
     uv run padmasana-build-teams-and-boards
     uv run padmasana-upload-attachments --file-service-url http://localhost:8080
     uv run padmasana-build-tasks --concurrency 8
 
-(`uv run padmasana-migration <subcommand>` works too - all four console
+(`uv run padmasana-migration <subcommand>` works too - all five console
 scripts point at the same subcommands below.) Each is independently
 resumable (DESIGN.md §4) - stop and re-run any of them any time.
 """
@@ -13,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import time
 
@@ -37,6 +40,35 @@ def _parse_team_owner_overrides(raw: list[str] | None) -> dict[str, str]:
         team_gid, user_gid = item.split("=", 1)
         overrides[team_gid.strip()] = user_gid.strip()
     return overrides
+
+
+def _cmd_import_users(args: argparse.Namespace) -> None:
+    _configure_logging(args.verbose)
+
+    from . import config
+    from .import_users import fetch_workspace_users, validate_emails, write_users
+
+    if not args.firebase_auth_api_url:
+        raise SystemExit("--firebase-auth-api-url (or env FIREBASE_AUTH_API_URL) is required.")
+
+    log.info(
+        "Fetching workspace users from %s (workspace=%s, organization_unit=%s)...",
+        args.firebase_auth_api_url, args.workspace, args.organization_unit,
+    )
+    users = fetch_workspace_users(args.firebase_auth_api_url, args.workspace, args.organization_unit)
+    path = write_users(config.BUILD_DIR, users)
+    log.info("=== Done: %d padmasana user(s) written to %s ===", len(users), path)
+
+    if args.skip_validate:
+        return
+    missing = validate_emails(config.BUILD_DIR, users)
+    if missing:
+        log.warning(
+            "%d email(s) referenced in %s have no matching padmasana user (see warnings above).",
+            len(missing), config.BUILD_DIR,
+        )
+    else:
+        log.info("Every email referenced in %s has a matching padmasana user.", config.BUILD_DIR)
 
 
 def _cmd_build_teams_and_boards(args: argparse.Namespace) -> None:
@@ -197,6 +229,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="padmasana-migration")
     sub = parser.add_subparsers(dest="command")
 
+    import_users = sub.add_parser(
+        "import-users",
+        help="Fetch padmasana's own workspace users - the exact same call padmasana-service's own "
+             "`import-users` CLI command makes to the Firebase Authorization service - and save them "
+             "to build/padmasana_users.json, then validate every email build/ references against it.",
+    )
+    import_users.add_argument(
+        "--firebase-auth-api-url", default=os.environ.get("FIREBASE_AUTH_API_URL"),
+        help="Base URL of the Firebase Authorization service (env: FIREBASE_AUTH_API_URL).",
+    )
+    import_users.add_argument("--workspace", required=True, help="Target workspace (as padmasana-service's own --workspace).")
+    import_users.add_argument("--organization-unit", required=True, help="Target organization unit (as padmasana-service's own --organization-unit).")
+    import_users.add_argument("--skip-validate", action="store_true", help="Only fetch/save - skip cross-checking build/ emails against the fetched list.")
+    import_users.add_argument("-v", "--verbose", action="store_true")
+    import_users.set_defaults(func=_cmd_import_users)
+
     build_teams_and_boards = sub.add_parser(
         "build-teams-and-boards",
         help="Script 2: build teams.json/boards.json/sections.json/tags.json and their pivots from data/.",
@@ -239,6 +287,10 @@ def main(argv: list[str] | None = None) -> None:
         parser.print_help()
         raise SystemExit(1)
     args.func(args)
+
+
+def import_users_main() -> None:
+    main(["import-users", *sys.argv[1:]])
 
 
 def build_teams_and_boards_main() -> None:
