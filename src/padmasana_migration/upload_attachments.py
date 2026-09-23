@@ -27,7 +27,10 @@ same role, just not sharing a filename with `build_tasks.py`'s own output.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import threading
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,6 +43,24 @@ from .file_service_client import FileServiceClient
 log = logging.getLogger("padmasana_migration.upload_attachments")
 
 UPLOAD_PATH = "asana-migration/attachments"
+
+try:
+    import fcntl
+    _HAVE_FLOCK = True
+except ImportError:  # pragma: no cover - non-POSIX platform
+    _HAVE_FLOCK = False
+
+# Guards every read-modify-write of an `uploaded_attachments.json`. Without
+# it, two workers finishing uploads for the same task at the same time both
+# read the file, each append their own record, and the last write wins -
+# silently dropping the other's record (the file service still has the
+# file, but nothing in build/ points at it). Jobs for one task's attachments
+# sit next to each other in the queue, so with --concurrency > 1 this was
+# the common case, not a rare one. The critical section is just a small
+# JSON read + write - never the upload itself - so one lock for everything
+# costs nothing measurable. Same threading-lock + flock pairing as
+# `JobQueue._locked`, so a second process on the same build/ is safe too.
+_records_thread_lock = threading.Lock()
 
 
 @dataclass
@@ -54,9 +75,45 @@ def _build_out_path(build_dir: Path, task_gid: str) -> Path:
     return build_dir / "tasks" / task_gid / "uploaded_attachments.json"
 
 
+@contextlib.contextmanager
+def _records_locked(build_dir: Path):
+    build_dir.mkdir(parents=True, exist_ok=True)
+    with _records_thread_lock:
+        if not _HAVE_FLOCK:
+            yield
+            return
+        with open(build_dir / ".uploaded_attachments.lock", "a+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def _append_record(build_dir: Path, task_gid: str, record: dict) -> bool:
+    """Adds `record` to the task's `uploaded_attachments.json` under
+    `_records_locked`. Returns False (writing nothing) if a record for the
+    same attachment is already there - only possible if another worker
+    uploaded the same attachment concurrently (e.g. a stale `running` job
+    reclaimed mid-upload, see `asana_migration.jobs.STALE_RUNNING_SECONDS`);
+    first record wins, so an attachment never ends up with two."""
+    out_path = _build_out_path(build_dir, task_gid)
+    with _records_locked(build_dir):
+        existing = read_json(out_path, default=[]) or []
+        if any(e.get("asana_gid") == record["asana_gid"] for e in existing):
+            return False
+        existing.append(record)
+        write_json(out_path, existing)
+        return True
+
+
 def _link_only_record(att: dict) -> dict:
+    # `view_url` is the real external destination (the gdrive/figma/etc. link
+    # itself); `permanent_url` is Asana's own `get_asset` redirect proxy,
+    # which depends on an active Asana session and won't resolve once this
+    # data lives outside Asana - so it's only a fallback, never preferred.
     return {
-        "url": att.get("permanent_url") or att.get("view_url"),
+        "url": att.get("view_url") or att.get("permanent_url"),
         "original_name": att.get("name"),
         "source": att.get("host"),
         "asana_gid": att["gid"],
@@ -75,9 +132,7 @@ def h_upload_attachment(ctx: UploadContext, payload: dict) -> None:
     if att is None:
         raise RuntimeError(f"attachment {attachment_gid} not found in {task_data_dir}/attachments.json anymore")
 
-    out_path = _build_out_path(ctx.build_dir, task_gid)
-    existing = read_json(out_path, default=[]) or []
-    if any(e.get("asana_gid") == attachment_gid for e in existing):
+    if attachment_gid in already_uploaded_gids(ctx.build_dir, task_gid):
         log.info("Task %s: attachment %s already uploaded - skipping", task_gid, attachment_gid)
         return
 
@@ -98,10 +153,22 @@ def h_upload_attachment(ctx: UploadContext, payload: dict) -> None:
         record = {"asana_gid": attachment_gid, "host": "asana", "metadata": response}
     else:
         log.info("Task %s: attachment %s is %s - link only, nothing to upload", task_gid, attachment_gid, att.get("host"))
-        record = {"asana_gid": attachment_gid, "host": att.get("host"), "metadata": _link_only_record(att)}
+        # A real upload's identity is the file service's own `metadata.uuid`;
+        # a link has no such thing, so one is minted here, once, and kept
+        # with the record - `build_tasks.py` reuses it rather than minting a
+        # fresh one on every rebuild (which would duplicate the row on
+        # every re-seed).
+        record = {
+            "asana_gid": attachment_gid, "host": att.get("host"),
+            "uuid": str(uuid.uuid4()), "metadata": _link_only_record(att),
+        }
 
-    existing.append(record)
-    write_json(out_path, existing)
+    if not _append_record(ctx.build_dir, task_gid, record):
+        log.warning(
+            "Task %s: attachment %s was recorded by another worker while this one was uploading - "
+            "keeping that record; this upload (file-service uuid %s) is an unreferenced duplicate",
+            task_gid, attachment_gid, (record.get("metadata") or {}).get("uuid"),
+        )
 
 
 HANDLERS = {
@@ -116,8 +183,17 @@ def already_uploaded_gids(build_dir: Path, task_gid: str) -> set[str]:
 def queue_pending_uploads(data_paths: Paths, build_dir: Path, queue: JobQueue) -> tuple[int, int]:
     """Walks every task's `attachments.json` under `data/` and queues an
     `upload_attachment` job for each one not already recorded in
-    `build/tasks/<gid>/uploaded_attachments.json`. Returns (queued, already_done)."""
-    queued = already_done = 0
+    `build/tasks/<gid>/uploaded_attachments.json`. Returns (queued, already_done).
+
+    That record - not the job's status - is what "uploaded" means here: an
+    attachment with no record is queued again even if an earlier job for it
+    is `done`. That's how a re-run recovers records lost to the old
+    concurrent-write bug (see `_records_thread_lock`), whose jobs were all
+    marked `done` and would otherwise be skipped by the queue's dedupe
+    forever. One `push_many` for the whole batch, not one `push` per
+    attachment (see `build_tasks.queue_pass1_jobs` for why)."""
+    items: list[tuple[str, dict, str]] = []
+    already_done = 0
     for attachments_path in data_paths.root.glob("*/tasks/*/attachments.json"):
         task_dir = attachments_path.parent
         task_gid = task_dir.name.split("_", 1)[0]
@@ -130,11 +206,10 @@ def queue_pending_uploads(data_paths: Paths, build_dir: Path, queue: JobQueue) -
             if gid in done_gids:
                 already_done += 1
                 continue
-            job = queue.push(
+            items.append((
                 "upload_attachment",
                 {"task_gid": task_gid, "attachment_gid": gid},
-                dedupe_key=f"upload_attachment:{gid}",
-            )
-            if job:
-                queued += 1
+                f"upload_attachment:{gid}",
+            ))
+    queued = queue.push_many(items, requeue_done=True)
     return queued, already_done

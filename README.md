@@ -426,3 +426,244 @@ own `--concurrency` flag (default 12, see above), independent of
 `--rate-limit` - concurrent file transfers aren't Asana API calls and don't
 draw from the rate limiter at all, only the one metadata re-fetch per
 attachment does.
+
+---
+
+# Part 2: Padmasana Migration (Transform & Seed Prep)
+
+Once your Asana data is exported to `./data`, the `padmasana_migration` toolset transforms it into finished, normalized, and validated JSON in `./build`. This output matches the exact database entities and schemas required by `padmasana-service` and the rich-text Tiptap formatting expected by `padmasana-app`.
+
+### Key Principles
+- **`data/` is strictly read-only**: The Asana export is never modified.
+- **Resumable and Idempotent**: You can safely interrupt (`Ctrl+C`) and re-run any command at any time.
+- **Config Persistence**: CLI parameters like URLs, workspaces, and organization units are automatically saved in `var/config.json` under `extra.padmasana` so you don't need to re-type them on every run.
+- **Missing User Detection**: All commands actively verify whether Asana users match Padmasana identities and report missing users.
+
+---
+
+## The Migration Workflow
+
+Follow these steps in order to prepare your data for seeding into Padmasana:
+
+```
+[data/ (Asana export)]
+        │
+        ├── Step 1 ──> padmasana-build-teams-and-boards  ──> build/teams.json, boards.json, sections.json
+        │
+        ├── Step 2 ──> padmasana-upload-attachments      ──> uploads to file-service, records file UUIDs
+        │
+        ├── Step 3 ──> padmasana-build-tasks            ──> build/tasks.json, comments.json, activity logs
+        │
+        ├── Step 4 ──> padmasana-map-users / import-users──> build/user_to_asana_gid.json, padmasana_users.json
+        │
+        ├── Step 5 ──> padmasana-inspect-task           ──> preview rich tasks (mentions, attachments, links)
+        │
+        └── Step 6 ──> padmasana-format-docs            ──> converts HTML to Tiptap mentions & links
+```
+
+---
+
+### Step 1: Build Teams, Boards, and Sections
+
+Builds Padmasana teams, boards, sections, tags, and their membership/pivot records from your exported Asana workspaces and projects.
+
+```bash
+uv run padmasana-build-teams-and-boards
+```
+
+**What it does:**
+- Generates `build/teams.json`, `build/boards.json`, `build/sections.json`, and `build/tags.json`.
+- Generates relational pivots: `build/board_team.json`, `build/board_member.json`, and `build/team_member.json`.
+- Assigns stable UUIDs so re-running retains existing IDs.
+- By default, assigns team ownership and board creator to the lowest Asana GID member. You can override specific team owners using `--team-owner`:
+
+```bash
+uv run padmasana-build-teams-and-boards --team-owner 1205361916477120=1205361916477125
+```
+
+---
+
+### Step 2: Upload Attachments to the File Service
+
+Uploads all downloaded Asana files (from `data/<workspace>/tasks/<task_gid>/attachments/`) to the Padmasana file service.
+
+```bash
+uv run padmasana-upload-attachments --file-service-url http://localhost:8080
+```
+
+**Useful flags:**
+- `--file-service-url` (required): URL of your Padmasana file-service instance.
+- `--file-service-token`: Optional Bearer token if authentication is required.
+- `--concurrency N`: Number of parallel uploads (default: `8`).
+
+**What it does:**
+- Reads local files on disk and uploads them using multipart form-data.
+- Saves upload metadata (including the file's assigned `uuid` and download URL) to `build/tasks/<task_gid>/uploaded_attachments.json`.
+- Uses a background worker queue (`var/padmasana_jobs.json`) so already-uploaded files are never re-uploaded if interrupted.
+- Safe at any `--concurrency`: records for the same task are written under a lock, so no upload record is ever lost.
+- `uploaded_attachments.json` is the source of truth, not the job queue: re-running queues every attachment that has no record yet, even if an earlier job for it says `done`. Re-run until it reports `0 failed permanently`.
+- Link-only attachments (Google Drive/external) get a uuid minted once here and kept across rebuilds.
+- Saves `--file-service-url` to `var/config.json`, so `padmasana-format-docs` builds image links against the same file service (the token is never saved).
+- If interrupted mid-upload, the file in flight may be uploaded again on the next run; that only leaves an unreferenced copy on the file service, never a duplicate record.
+
+---
+
+### Step 3: Build Tasks, Subtasks, Comments, and Activity Logs
+
+Builds all task entities, comment streams, activity logs, tag associations, and attachment splits.
+
+```bash
+uv run padmasana-build-tasks --concurrency 8
+```
+
+**What it does:**
+- **Pass 1**: Converts raw Asana task JSON into Padmasana task entities, separates task-level attachments from comment-level attachments, parses comment threads, builds `task_activity_log.json`, and maps sections and tags.
+- **Pass 2**: Resolves parent/subtask relationships (`parent_task_uuid`).
+- **Compile Step**: Combines individual task files from `build/tasks/*/` into root compilation files (`build/tasks.json`, `build/comments.json`, `build/attachments.json`, `build/comment_attachments.json`, `build/board_task.json`, etc.).
+- Alerts if any Asana task assignees/creators do not exist in `build/padmasana_users.json`.
+
+**Useful flags:**
+- `--concurrency N`: Parallel task workers (default: `8`).
+- `--compile`: Skip re-parsing and only recompile `build/tasks/*/` into root `build/` files.
+- `--no-compile`: Run passes 1 and 2 without running the compile step.
+
+---
+
+### Step 4: User Mapping and Identity Synchronization
+
+Padmasana references users via a `user_reference_code` / Firebase Auth UUID, whereas Asana references users by GID, name, and email. To ensure all mentions, assignees, and comment authors link correctly:
+
+#### 1. Generate the Asana user map
+```bash
+uv run padmasana-map-users
+```
+Scans the entire Asana export (teams, projects, tasks, comments, and inline mentions) and generates `build/user_to_asana_gid.json`. It maps:
+- `asana_gid`
+- `name`
+- `email`
+- `user_reference_code` (linked from `padmasana_users.json` if available)
+- `in_padmasana` (boolean)
+
+If any Asana users are missing from `build/padmasana_users.json`, the command prints a summary warning listing them.
+
+#### 2. Import Padmasana users from Firebase Auth
+```bash
+uv run padmasana-import-users \
+  --firebase-auth-api-url http://localhost:8081 \
+  --workspace my-workspace \
+  --organization-unit engineering
+```
+- Fetches all workspace users from the Firebase Authorization service (identical to `padmasana-service`'s `import-users` CLI command).
+- Writes and **merges** user records into `build/padmasana_users.json` (so running for multiple workspaces or organization units accumulates users rather than overwriting).
+- Automatically saves `--firebase-auth-api-url`, `--workspace`, and `--organization-unit` to `var/config.json`. After the first run, you can simply execute:
+  ```bash
+  uv run padmasana-import-users
+  ```
+- Automatically re-runs user mapping and reports any Asana users who are still missing from Padmasana.
+
+---
+
+### Step 5: Inspect and Verify Rich Tasks
+
+Before running document formatting across all tasks, use `padmasana-inspect-task` to find and inspect tasks with complex formatting (user mentions, comment threads, attachments, and board/task links):
+
+#### List top candidate tasks ranked by field richness:
+```bash
+uv run padmasana-inspect-task --list-candidates
+```
+Displays a table of candidate tasks scored by number of attachments, comments, mentions in descriptions, and mentions in comments.
+
+#### Inspect a specific task:
+```bash
+uv run padmasana-inspect-task --task-gid 1214535540091814
+```
+*(If `--task-gid` is omitted, it automatically picks the richest task in your build).*
+
+This tool prints:
+- Task metadata (name, GID, UUID, board, section, assignee).
+- Attachments list (task-level and comment-level with file service URLs).
+- Comments list (authors, timestamps, attachments).
+- Side-by-side **Before vs. After HTML** showing how Asana mentions, images, and links convert to Padmasana / Tiptap format.
+
+---
+
+### Step 6: Format Descriptions and Comments (`format-docs`)
+
+Converts all Asana-formatted HTML across task descriptions and comments into Padmasana-compliant HTML:
+
+```bash
+uv run padmasana-format-docs \
+  --app-url http://localhost:3000 \
+  --file-service-url http://localhost:8080
+```
+
+**HTML Transformations Performed:**
+1. **User Mentions**:
+   - *From*: `<a data-asana-type="user" data-asana-gid="1205361916477125">@Alice</a>`
+   - *To*: `<span class="mention" data-type="mention" data-id="user-ref-uuid" data-label="Alice" data-profile-url="" data-email="alice@company.com">@Alice</span>`
+2. **Inline Attachments & Images**:
+   - *From*: `<img data-asana-type="attachment" data-asana-gid="1205361916477130" src="..."/>`
+   - *To*: `<img src="http://localhost:8080/files/<file_uuid>/download" data-file-uuid="<file_uuid>" alt="screenshot.png" />`
+3. **Asana Board & Task Links**:
+   - *Board link*: `https://app.asana.com/0/<board_gid>/list` → `http://localhost:3000/my-boards/<board_uuid>`
+   - *Task link*: `https://app.asana.com/0/<board_gid>/<task_gid>` → `http://localhost:3000/my-boards/<board_uuid>?taskId=<task_uuid>`
+
+**Features & Flags:**
+- Automatically updates both per-task files (`build/tasks/<gid>/task.json`, `comments.json`) and compiled flat files (`build/tasks.json`, `build/comments.json`).
+- Automatically populates the `body` field on comments (expected by `padmasana-app`'s comment editor).
+- Automatically saves `--app-url` and `--file-service-url` in `var/config.json`.
+- `--dry-run`: Test and preview transformations without modifying files on disk.
+- `--task-gid <gid>`: Format only a single task.
+- Reports any unresolved user mentions at the end.
+
+---
+
+## Quick Command Reference
+
+| Command | Purpose | Input / Flags | Key Outputs |
+|---|---|---|---|
+| `uv run padmasana-build-teams-and-boards` | Build teams, boards, sections, tags | `--team-owner GID=GID` | `build/teams.json`, `boards.json`, `sections.json` |
+| `uv run padmasana-upload-attachments` | Upload local attachments to file service | `--file-service-url`, `--concurrency` | `build/tasks/<gid>/uploaded_attachments.json` |
+| `uv run padmasana-build-tasks` | Build tasks, comments, activity logs | `--concurrency`, `--compile` | `build/tasks.json`, `comments.json`, `build/tasks/*/` |
+| `uv run padmasana-map-users` | Map Asana users & report missing | `-v` | `build/user_to_asana_gid.json` |
+| `uv run padmasana-import-users` | Fetch Firebase users into build | `--firebase-auth-api-url`, `--workspace`, `--organization-unit` | `build/padmasana_users.json` |
+| `uv run padmasana-inspect-task` | Preview sample task HTML conversion | `--list-candidates`, `--task-gid` | Console report & side-by-side diff |
+| `uv run padmasana-format-docs` | Convert HTML (mentions, files, links) | `--app-url`, `--file-service-url`, `--dry-run` | Formatted `task.json`, `comments.json`, `tasks.json` |
+
+---
+
+## Where Padmasana Build Files Live
+
+Everything produced for Padmasana lands under `./build`:
+
+```
+build/
+  teams.json                     # Padmasana team entities
+  boards.json                    # Padmasana board entities
+  sections.json                  # Padmasana board section entities
+  tags.json                      # Board tags
+  board_team.json                # Board-team pivot associations
+  board_member.json              # Board membership
+  team_member.json               # Team membership
+  padmasana_users.json           # Cached Padmasana Firebase Auth users
+  user_to_asana_gid.json         # Asana GID <-> Padmasana user reference mapping
+  tasks.json                     # Compiled flat task entities
+  board_task.json                # Task <-> Board associations
+  board_section.json             # Task <-> Board section associations
+  task_parent.json               # Subtask <-> Parent task associations
+  task_tag.json                  # Task <-> Tag associations
+  comments.json                  # Compiled comments (with Tiptap HTML body)
+  attachments.json               # Compiled task-level attachments (with file-service UUIDs)
+  comment_attachments.json       # Compiled comment attachments (with file-service UUIDs)
+  task_activity_log.json         # Converted history/activity logs
+  tasks/<task_gid>/              # Individual task records
+    task.json                    # Task record (with Tiptap description_html)
+    comments.json                # Comment thread
+    attachments.json             # Task-level attachments
+    comment_attachments.json     # Comment-level attachments
+    task_activity_log.json       # Task activity events
+    uploaded_attachments.json    # File-service upload metadata
+```
+
+All files in `build/` are ready to be seeded directly into the Padmasana database using `padmasana-service` seeder scripts.
+

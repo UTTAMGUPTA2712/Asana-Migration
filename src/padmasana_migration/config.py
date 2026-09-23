@@ -25,3 +25,21 @@ JOBS_PATH = VAR_DIR / "padmasana_jobs.json"
 # Bandwidth/CPU-bound concurrency knob for scripts 1 and 3 (DESIGN.md §4) -
 # not derived from any rate limit, there's no Asana call to pace here.
 DEFAULT_CONCURRENCY = 8
+
+
+def get_padmasana_config() -> dict:
+    from asana_migration.config import load_config
+    cfg = load_config()
+    return cfg.extra.get("padmasana", {})
+
+
+def save_padmasana_config(**updates) -> dict:
+    from asana_migration.config import load_config, save_config
+    cfg = load_config()
+    pad_cfg = cfg.extra.setdefault("padmasana", {})
+    for k, v in updates.items():
+        if v is not None:
+            pad_cfg[k] = v
+    save_config(cfg)
+    return pad_cfg
+

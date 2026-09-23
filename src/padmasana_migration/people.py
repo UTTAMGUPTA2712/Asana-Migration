@@ -20,12 +20,17 @@ Two things still need doing entirely offline, from the export alone:
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 
-from asana_migration.storage import Paths, read_json
+from asana_migration.storage import Paths, read_json, write_json
+
+log = logging.getLogger("padmasana_migration.people")
 
 PROFILE_GID_RE = re.compile(r'/profile/(\d+)"')
+USER_MENTION_RE = re.compile(r'<a\b[^>]*\bdata-asana-type=["\']user["\'][^>]*\bdata-asana-gid=["\'](\d+)["\'][^>]*>(.*?)</a>')
+USER_MENTION_ALT_RE = re.compile(r'<a\b[^>]*\bdata-asana-gid=["\'](\d+)["\'][^>]*\bdata-asana-type=["\']user["\'][^>]*>(.*?)</a>')
 
 
 def build_person_registry(data_paths: Paths) -> dict[str, dict]:
@@ -143,3 +148,90 @@ def resolve_profile_link_email(html_text: str | None, registry: dict[str, dict])
     target_gid = gids[-1]
     person = registry.get(target_gid)
     return (person.get("email") if person else None), target_gid
+
+
+def load_user_map(build_dir: Path) -> dict[str, dict]:
+    """Loads build/user_to_asana_gid.json if present, returning a dict of asana_gid -> user dict."""
+    path = build_dir / "user_to_asana_gid.json"
+    return read_json(path, default={}) or {}
+
+
+def build_user_map(
+    data_paths: Paths,
+    build_dir: Path,
+    out_path: Path | None = None,
+) -> dict[str, dict]:
+    """Scans all Asana users across export and comments/mentions, cross-references
+    with padmasana_users.json, preserves any existing manual overrides, and saves
+    to build/user_to_asana_gid.json."""
+    if out_path is None:
+        out_path = build_dir / "user_to_asana_gid.json"
+
+    registry = build_person_registry(data_paths)
+
+    # Also scan comments for mentioned user gids
+    comments_file = build_dir / "comments.json"
+    if comments_file.exists():
+        for c in read_json(comments_file, default=[]) or []:
+            html = c.get("html_text") or ""
+            for m in USER_MENTION_RE.finditer(html):
+                gid, raw_name = m.group(1), m.group(2).lstrip("@").strip()
+                if gid not in registry:
+                    registry[gid] = {"email": None, "name": raw_name}
+            for m in USER_MENTION_ALT_RE.finditer(html):
+                gid, raw_name = m.group(1), m.group(2).lstrip("@").strip()
+                if gid not in registry:
+                    registry[gid] = {"email": None, "name": raw_name}
+
+    padmasana_users = read_json(build_dir / "padmasana_users.json", default=[]) or []
+    users_by_email: dict[str, dict] = {}
+    users_by_name: dict[str, dict] = {}
+    for pu in padmasana_users:
+        if pu.get("email"):
+            users_by_email[pu["email"].strip().lower()] = pu
+        full_name = f"{pu.get('name') or ''} {pu.get('last_name') or ''}".strip().lower()
+        if full_name:
+            users_by_name[full_name] = pu
+
+    existing_map = read_json(out_path, default={}) or {}
+
+    result_map: dict[str, dict] = {}
+    for gid, person in sorted(registry.items(), key=lambda item: int(item[0]) if item[0].isdigit() else item[0]):
+        email = (person.get("email") or "").strip()
+        name = (person.get("name") or "").strip()
+        existing = existing_map.get(gid) or {}
+
+        matched_pu = None
+        if email and email.lower() in users_by_email:
+            matched_pu = users_by_email[email.lower()]
+        elif name and name.lower() in users_by_name:
+            matched_pu = users_by_name[name.lower()]
+
+        user_ref = existing.get("user_reference_code") or (matched_pu.get("user_reference_code") if matched_pu else None)
+        profile_url = existing.get("profile_url") or (matched_pu.get("profile_url") if matched_pu else None)
+        pad_name = existing.get("padmasana_name") or (
+            f"{matched_pu.get('name') or ''} {matched_pu.get('last_name') or ''}".strip() if matched_pu else None
+        )
+        workspace = existing.get("workspace") or (matched_pu.get("workspace") if matched_pu else None)
+
+        status = "mapped" if user_ref else "missing_padmasana_user"
+
+        result_map[gid] = {
+            "asana_gid": gid,
+            "name": name,
+            "email": email or (matched_pu.get("email") if matched_pu else "") or existing.get("email") or "",
+            "user_reference_code": user_ref,
+            "padmasana_name": pad_name or name,
+            "profile_url": profile_url,
+            "workspace": workspace,
+            "status": status,
+        }
+
+    write_json(out_path, result_map)
+    mapped_count = sum(1 for u in result_map.values() if u["status"] == "mapped")
+    missing_count = len(result_map) - mapped_count
+    log.info(
+        "User map written to %s (%d total Asana users, %d mapped, %d missing in padmasana_users.json)",
+        out_path, len(result_map), mapped_count, missing_count,
+    )
+    return result_map

@@ -235,6 +235,7 @@ def _build_sections(task: dict, task_uuid: str, ref: ReferenceData) -> tuple[lis
         board_sections[entry["uuid"]] = {
             "uuid": entry["uuid"],
             "board_uuid": entry["board_uuid"],
+            "section_uuid": entry["uuid"],
         }
         section_tasks.append({"task_uuid": task_uuid, "board_section_uuid": entry["uuid"]})
     return list(board_sections.values()), section_tasks
@@ -288,23 +289,30 @@ def _build_attachments(
         added_story = attachment_added_by_asset_id.get(gid)
         uploaded_by_email = email_of(added_story.get("created_by")) if added_story else created_by_email
         created_at = added_story.get("created_at") if added_story else att.get("created_at")
+        meta = uploaded.get("metadata") or {}
+        # Real uploads: the file service's own uuid. Link-only: the uuid
+        # `upload_attachments.py` minted once for it. Only records written
+        # before that existed fall through to a fresh (unstable) one.
+        att_uuid = meta.get("uuid") or uploaded.get("uuid") or str(uuid.uuid4())
 
         comment = embedded_in.get(gid)
         if comment is not None:
             comment_level.append({
+                "uuid": att_uuid,
                 "asana_gid": gid,
                 "comment_uuid": comment["uuid"],
                 "name": att.get("name"),
-                "metadata": uploaded["metadata"],
+                "metadata": meta,
                 "uploaded_by_email": uploaded_by_email,
                 "created_at": created_at,
             })
         else:
             task_level.append({
+                "uuid": att_uuid,
                 "asana_gid": gid,
                 "task_uuid": task_uuid,
                 "name": att.get("name"),
-                "metadata": uploaded["metadata"],
+                "metadata": meta,
                 "uploaded_by_email": uploaded_by_email,
                 "created_at": created_at,
             })

@@ -42,33 +42,128 @@ def _parse_team_owner_overrides(raw: list[str] | None) -> dict[str, str]:
     return overrides
 
 
+def _cmd_map_users(args: argparse.Namespace) -> None:
+    _configure_logging(args.verbose)
+
+    from . import config
+    from .import_users import report_missing_users
+    from .people import build_user_map
+    from asana_migration.storage import Paths
+
+    data_paths = Paths(root=config.DATA_DIR)
+    log.info("Building user-to-asana_gid map from %s and %s ...", config.DATA_DIR, config.BUILD_DIR)
+    user_map = build_user_map(data_paths, config.BUILD_DIR)
+    log.info("=== Done: %d user(s) mapped in %s/user_to_asana_gid.json ===", len(user_map), config.BUILD_DIR)
+    report_missing_users(config.BUILD_DIR)
+
+
 def _cmd_import_users(args: argparse.Namespace) -> None:
     _configure_logging(args.verbose)
 
     from . import config
-    from .import_users import fetch_workspace_users, validate_emails, write_users
+    from .import_users import fetch_workspace_users, report_missing_users, validate_emails, write_users
+    from .people import build_user_map
+    from asana_migration.storage import Paths, read_json
 
-    if not args.firebase_auth_api_url:
-        raise SystemExit("--firebase-auth-api-url (or env FIREBASE_AUTH_API_URL) is required.")
+    pad_cfg = config.get_padmasana_config()
+    firebase_auth_api_url = args.firebase_auth_api_url or pad_cfg.get("firebase_auth_api_url") or os.environ.get("FIREBASE_AUTH_API_URL")
+    workspace = args.workspace or pad_cfg.get("workspace")
+    organization_unit = args.organization_unit or pad_cfg.get("organization_unit")
+
+    if not firebase_auth_api_url:
+        raise SystemExit("--firebase-auth-api-url (or env FIREBASE_AUTH_API_URL or config) is required.")
+    if not workspace:
+        raise SystemExit("--workspace (or config) is required.")
+    if not organization_unit:
+        raise SystemExit("--organization-unit (or config) is required.")
+
+    if not args.no_save_config:
+        config.save_padmasana_config(
+            firebase_auth_api_url=firebase_auth_api_url,
+            workspace=workspace,
+            organization_unit=organization_unit,
+        )
 
     log.info(
         "Fetching workspace users from %s (workspace=%s, organization_unit=%s)...",
-        args.firebase_auth_api_url, args.workspace, args.organization_unit,
+        firebase_auth_api_url, workspace, organization_unit,
     )
-    users = fetch_workspace_users(args.firebase_auth_api_url, args.workspace, args.organization_unit)
-    path = write_users(config.BUILD_DIR, users)
-    log.info("=== Done: %d padmasana user(s) written to %s ===", len(users), path)
+    users = fetch_workspace_users(firebase_auth_api_url, workspace, organization_unit)
+    path = write_users(config.BUILD_DIR, users, merge=not args.no_merge)
+    # Validate against the full cumulative file, not just this run's batch -
+    # otherwise a second import (a different workspace/org-unit) reports
+    # every earlier-imported person as "missing" again, since they're not
+    # in `users` (this run's fetch) even though they're already on disk.
+    all_users = read_json(path, default=users) or users
+    log.info("=== Done: %d user(s) fetched this run, %d total in %s ===", len(users), len(all_users), path)
 
-    if args.skip_validate:
+    # Refresh user map
+    data_paths = Paths(root=config.DATA_DIR)
+    build_user_map(data_paths, config.BUILD_DIR)
+
+    if not args.skip_validate:
+        validate_emails(config.BUILD_DIR, all_users)
+        report_missing_users(config.BUILD_DIR, all_users)
+
+
+def _cmd_format_docs(args: argparse.Namespace) -> None:
+    _configure_logging(args.verbose)
+
+    from . import config
+    from .format_docs import format_all_tasks, load_format_context
+    from .import_users import report_missing_users
+    from asana_migration.storage import Paths
+
+    pad_cfg = config.get_padmasana_config()
+    app_url = args.app_url or pad_cfg.get("app_url") or os.environ.get("PADMASANA_APP_URL") or "http://localhost:3000"
+    file_service_url = args.file_service_url or pad_cfg.get("file_service_url") or os.environ.get("FILE_SERVICE_URL") or "http://localhost:8080"
+
+    if not args.no_save_config and not args.dry_run:
+        config.save_padmasana_config(app_url=app_url, file_service_url=file_service_url)
+
+    data_paths = Paths(root=config.DATA_DIR)
+    log.info("Loading format context (app_url=%s, file_service_url=%s)...", app_url, file_service_url)
+    ctx = load_format_context(config.BUILD_DIR, app_url=app_url, file_service_url=file_service_url, data_paths=data_paths)
+
+    log.info("Formatting HTML in tasks and comments (filter=%s, dry_run=%s)...", args.task_gid or "all", args.dry_run)
+    start = time.monotonic()
+    tasks_count, comments_count = format_all_tasks(config.BUILD_DIR, ctx, task_gid_filter=args.task_gid, dry_run=args.dry_run)
+    elapsed = time.monotonic() - start
+
+    log.info("=== Done in %.1fs: %d task(s) and %d comment(s) formatted ===", elapsed, tasks_count, comments_count)
+    report_missing_users(config.BUILD_DIR)
+
+
+def _cmd_inspect_task(args: argparse.Namespace) -> None:
+    _configure_logging(args.verbose)
+
+    from . import config
+    from .format_docs import load_format_context
+    from .inspect_task import find_richest_tasks, inspect_task, print_task_inspection
+    from asana_migration.storage import Paths
+
+    if args.list_candidates:
+        candidates = find_richest_tasks(config.BUILD_DIR, limit=args.limit)
+        print("\n" + "=" * 90)
+        print(f"TOP {len(candidates)} CANDIDATE TASKS BY FIELD RICHNESS")
+        print("=" * 90)
+        print(f"{'GID':<18} {'Score':<6} {'Atts':<5} {'CommAtts':<8} {'Comms':<6} {'Mentions(D/C)':<14} {'Name'}")
+        print("-" * 90)
+        for c in candidates:
+            m_str = f"{'Y' if c['has_desc_mention'] else '-'}/{'Y' if c['has_comm_mention'] else '-'}"
+            print(f"{c['gid']:<18} {c['score']:<6} {c['attachments_count']:<5} {c['comment_attachments_count']:<8} {c['comments_count']:<6} {m_str:<14} {c['name'][:30]}")
+        print("=" * 90 + "\n")
         return
-    missing = validate_emails(config.BUILD_DIR, users)
-    if missing:
-        log.warning(
-            "%d email(s) referenced in %s have no matching padmasana user (see warnings above).",
-            len(missing), config.BUILD_DIR,
-        )
-    else:
-        log.info("Every email referenced in %s has a matching padmasana user.", config.BUILD_DIR)
+
+    pad_cfg = config.get_padmasana_config()
+    app_url = args.app_url or pad_cfg.get("app_url") or os.environ.get("PADMASANA_APP_URL") or "http://localhost:3000"
+    file_service_url = args.file_service_url or pad_cfg.get("file_service_url") or os.environ.get("FILE_SERVICE_URL") or "http://localhost:8080"
+
+    data_paths = Paths(root=config.DATA_DIR)
+    ctx = load_format_context(config.BUILD_DIR, app_url=app_url, file_service_url=file_service_url, data_paths=data_paths)
+    data = inspect_task(config.BUILD_DIR, task_gid=args.task_gid, ctx=ctx)
+    print_task_inspection(data)
+
 
 
 def _cmd_build_teams_and_boards(args: argparse.Namespace) -> None:
@@ -105,6 +200,12 @@ def _cmd_upload_attachments(args: argparse.Namespace) -> None:
     from asana_migration.jobs import JobQueue
     from asana_migration.storage import Paths
     from asana_migration.worker import WorkerPool
+
+    # Saved so `format-docs`/`inspect-task` build image/download URLs against
+    # the same file service the files actually went to, instead of silently
+    # falling back to their localhost default when the flag is left off.
+    # The token is deliberately never saved.
+    config.save_padmasana_config(file_service_url=args.file_service_url.rstrip("/"))
 
     data_paths = Paths(root=config.DATA_DIR)
     queue = JobQueue(path=config.JOBS_PATH)
@@ -150,7 +251,7 @@ def _cmd_upload_attachments(args: argparse.Namespace) -> None:
               elapsed, stats["done"] - done_at_start, stats["error"])
     if stats["error"]:
         log.warning("Some uploads failed permanently after retries. Re-run to retry just those.")
-    log.info("Written under %s/tasks/<task_gid>/attachments.json", config.BUILD_DIR)
+    log.info("Written under %s/tasks/<task_gid>/uploaded_attachments.json", config.BUILD_DIR)
 
 
 def _cmd_build_tasks(args: argparse.Namespace) -> None:
@@ -224,10 +325,20 @@ def _cmd_build_tasks(args: argparse.Namespace) -> None:
         counts = compile_build(config.BUILD_DIR)
         log.info("=== Done: %s ===", ", ".join(f"{k}={v}" for k, v in counts.items()))
 
+    from .import_users import report_missing_users
+    report_missing_users(config.BUILD_DIR)
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="padmasana-migration")
     sub = parser.add_subparsers(dest="command")
+
+    map_users = sub.add_parser(
+        "map-users",
+        help="Scan Asana export and comments/mentions to build build/user_to_asana_gid.json and check against padmasana_users.json.",
+    )
+    map_users.add_argument("-v", "--verbose", action="store_true")
+    map_users.set_defaults(func=_cmd_map_users)
 
     import_users = sub.add_parser(
         "import-users",
@@ -237,10 +348,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     import_users.add_argument(
         "--firebase-auth-api-url", default=os.environ.get("FIREBASE_AUTH_API_URL"),
-        help="Base URL of the Firebase Authorization service (env: FIREBASE_AUTH_API_URL).",
+        help="Base URL of the Firebase Authorization service (env: FIREBASE_AUTH_API_URL or config).",
     )
-    import_users.add_argument("--workspace", required=True, help="Target workspace (as padmasana-service's own --workspace).")
-    import_users.add_argument("--organization-unit", required=True, help="Target organization unit (as padmasana-service's own --organization-unit).")
+    import_users.add_argument("--workspace", help="Target workspace (as padmasana-service's own --workspace or config).")
+    import_users.add_argument("--organization-unit", help="Target organization unit (as padmasana-service's own --organization-unit or config).")
+    import_users.add_argument("--no-merge", action="store_true", help="Overwrite padmasana_users.json instead of merging.")
+    import_users.add_argument("--no-save-config", action="store_true", help="Do not save options to var/config.json.")
     import_users.add_argument("--skip-validate", action="store_true", help="Only fetch/save - skip cross-checking build/ emails against the fetched list.")
     import_users.add_argument("-v", "--verbose", action="store_true")
     import_users.set_defaults(func=_cmd_import_users)
@@ -277,6 +390,30 @@ def build_parser() -> argparse.ArgumentParser:
     build_tasks.add_argument("-v", "--verbose", action="store_true")
     build_tasks.set_defaults(func=_cmd_build_tasks)
 
+    format_docs = sub.add_parser(
+        "format-docs",
+        help="Transform HTML content in task descriptions and comments into Padmasana/Tiptap format (mentions, attachments, task/board links).",
+    )
+    format_docs.add_argument("--app-url", help="Padmasana App base URL (env: PADMASANA_APP_URL or config, default: http://localhost:3000).")
+    format_docs.add_argument("--file-service-url", help="File service base URL (env: FILE_SERVICE_URL or config, default: http://localhost:8080).")
+    format_docs.add_argument("--task-gid", help="Format only this specific task.")
+    format_docs.add_argument("--dry-run", action="store_true", help="Preview transformations without writing to disk.")
+    format_docs.add_argument("--no-save-config", action="store_true", help="Do not save URL arguments into var/config.json.")
+    format_docs.add_argument("-v", "--verbose", action="store_true")
+    format_docs.set_defaults(func=_cmd_format_docs)
+
+    inspect_task_parser = sub.add_parser(
+        "inspect-task",
+        help="Find and inspect task(s) containing mentions, attachments, and links to verify formatting.",
+    )
+    inspect_task_parser.add_argument("--task-gid", help="Task GID to inspect (default: finds richest task automatically).")
+    inspect_task_parser.add_argument("--list-candidates", action="store_true", help="List top candidate tasks ranked by field richness.")
+    inspect_task_parser.add_argument("--limit", type=int, default=10, help="Number of candidates to list (default: 10).")
+    inspect_task_parser.add_argument("--app-url", help="Padmasana App base URL for preview.")
+    inspect_task_parser.add_argument("--file-service-url", help="File service base URL for preview.")
+    inspect_task_parser.add_argument("-v", "--verbose", action="store_true")
+    inspect_task_parser.set_defaults(func=_cmd_inspect_task)
+
     return parser
 
 
@@ -287,6 +424,10 @@ def main(argv: list[str] | None = None) -> None:
         parser.print_help()
         raise SystemExit(1)
     args.func(args)
+
+
+def map_users_main() -> None:
+    main(["map-users", *sys.argv[1:]])
 
 
 def import_users_main() -> None:
@@ -305,5 +446,14 @@ def build_tasks_main() -> None:
     main(["build-tasks", *sys.argv[1:]])
 
 
+def format_docs_main() -> None:
+    main(["format-docs", *sys.argv[1:]])
+
+
+def inspect_task_main() -> None:
+    main(["inspect-task", *sys.argv[1:]])
+
+
 if __name__ == "__main__":
     main()
+

@@ -71,10 +71,71 @@ def fetch_workspace_users(
     ]
 
 
-def write_users(build_dir: Path, users: list[dict]) -> Path:
+def write_users(build_dir: Path, users: list[dict], merge: bool = True) -> Path:
     path = build_dir / "padmasana_users.json"
-    write_json(path, users)
+    if merge and path.exists():
+        existing = read_json(path, default=[]) or []
+        by_ref = {u.get("user_reference_code"): u for u in existing if u.get("user_reference_code")}
+        by_email = {u.get("email").strip().lower(): u for u in existing if u.get("email")}
+        for u in users:
+            ref = u.get("user_reference_code")
+            em = (u.get("email") or "").strip().lower()
+            if ref and ref in by_ref:
+                by_ref[ref].update(u)
+            elif em and em in by_email:
+                by_email[em].update(u)
+            else:
+                existing.append(u)
+                if ref:
+                    by_ref[ref] = u
+                if em:
+                    by_email[em] = u
+        final_users = existing
+    else:
+        final_users = users
+
+    write_json(path, final_users)
     return path
+
+
+def report_missing_users(build_dir: Path, users: list[dict] | None = None) -> list[dict]:
+    """Cross-checks all Asana users in user_to_asana_gid.json against padmasana_users.json
+    and returns the list of Asana users that still lack Padmasana data, logging clear warnings."""
+    if users is None:
+        users_path = build_dir / "padmasana_users.json"
+        if not users_path.exists():
+            log.warning(
+                "=== %s does not exist - `padmasana-import-users` has never been run ===", users_path,
+            )
+            log.warning(
+                "Every mention/assignee/collaborator below will fall back to raw Asana data (no real "
+                "user_reference_code) until you run `padmasana-import-users --firebase-auth-api-url <url> "
+                "--workspace <ws> --organization-unit <ou>` first."
+            )
+        users = read_json(users_path, default=[]) or []
+    known_emails = {u["email"].strip().lower() for u in users if u.get("email")}
+    known_refs = {u["user_reference_code"] for u in users if u.get("user_reference_code")}
+
+    user_map = read_json(build_dir / "user_to_asana_gid.json", default={}) or {}
+    missing = []
+    for gid, u in user_map.items():
+        ref = u.get("user_reference_code")
+        em = (u.get("email") or "").strip().lower()
+        if (ref and ref in known_refs) or (em and em in known_emails):
+            continue
+        missing.append(u)
+
+    if missing:
+        log.warning("=== %d Asana user(s) still have no data in padmasana_users.json ===", len(missing))
+        for m in missing[:20]:
+            log.warning("  - %s (email: '%s', asana_gid: %s)", m.get("name") or "Unknown", m.get("email") or "", m.get("asana_gid"))
+        if len(missing) > 20:
+            log.warning("  ... and %d more (see %s/user_to_asana_gid.json)", len(missing) - 20, build_dir)
+        log.warning("Run `padmasana-import-users --workspace <workspace> --organization-unit <ou>` to import them.")
+    else:
+        log.info("All %d Asana user(s) have matching Padmasana user data.", len(user_map))
+
+    return missing
 
 
 def _collect_referenced_emails(build_dir: Path) -> dict[str, list[str]]:
@@ -109,12 +170,13 @@ def validate_emails(build_dir: Path, users: list[dict]) -> list[str]:
     """Cross-checks every email build/'s flat files reference against the
     fetched padmasana user list. Returns the sorted list of emails with no
     matching padmasana user."""
-    known = {u["email"] for u in users if u.get("email")}
+    known = {u["email"].strip().lower() for u in users if u.get("email")}
     referenced = _collect_referenced_emails(build_dir)
-    missing = sorted(email for email in referenced if email not in known)
+    missing = sorted(email for email in referenced if email.strip().lower() not in known)
     for email in missing:
         log.warning(
             "email %s (referenced in %s) has no matching padmasana user",
             email, ", ".join(referenced[email]),
         )
     return missing
+

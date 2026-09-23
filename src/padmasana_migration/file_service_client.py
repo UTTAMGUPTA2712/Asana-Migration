@@ -10,6 +10,7 @@ file-service uploads"); concurrency is bounded entirely by
 from __future__ import annotations
 
 import json
+import mimetypes
 
 import requests
 
@@ -36,8 +37,12 @@ class FileServiceClient:
         untouched as the eventual `attachment`/`comment_attachment` row's
         `metadata` (DESIGN.md §5.7)."""
         url = f"{self.base_url}/files"
+        # Sent explicitly, the way a browser upload from padmasana-app does -
+        # without it the part goes up with no Content-Type and the file
+        # service stores every migrated file as a generic binary.
+        content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
         with open(file_path, "rb") as fh:
-            files = {"file": (name, fh)}
+            files = {"file": (name, fh, content_type)}
             data = {"path": path, "name": name, "metadata": json.dumps(metadata)}
             resp = self.session.post(url, files=files, data=data, timeout=self.timeout)
         if resp.status_code not in (200, 201):
