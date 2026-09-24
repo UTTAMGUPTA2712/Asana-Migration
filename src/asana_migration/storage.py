@@ -151,10 +151,11 @@ def _unique_tmp_path(path: Path) -> Path:
     return path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp")
 
 
-def write_json(path: Path, data) -> None:
+def write_json(path: Path, data, *, indent: int | None = 2) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = _unique_tmp_path(path)
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=False))
+    separators = None if indent is not None else (",", ":")
+    tmp.write_text(json.dumps(data, indent=indent, separators=separators, sort_keys=False))
     tmp.replace(path)
 
 

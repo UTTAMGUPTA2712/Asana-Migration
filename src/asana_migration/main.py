@@ -109,7 +109,7 @@ def _cmd_import_all(args: argparse.Namespace) -> None:
     )
     from .jobs import JobQueue
     from .rate_limiter import RateLimiter
-    from .worker import RPM_PER_WORKER, WorkerPool, desired_worker_count
+    from .worker import RPM_PER_WORKER, STATUS_POLL_SECONDS, WorkerPool, desired_worker_count
     from .storage import Meta, Paths
 
     cfg = config_mod.load_config()
@@ -223,7 +223,7 @@ def _cmd_import_all(args: argparse.Namespace) -> None:
                     stats["done"] - done_at_start, stats["queued"], stats["running"], stats["error"],
                 )
                 last_report = now
-            time.sleep(1)
+            time.sleep(STATUS_POLL_SECONDS)
     finally:
         pool.stop()
 
@@ -275,7 +275,7 @@ def _cmd_download_attachments(args: argparse.Namespace) -> None:
     from .importer import ImporterContext, queue_pending_attachment_downloads
     from .jobs import JobQueue
     from .rate_limiter import RateLimiter
-    from .worker import WorkerPool
+    from .worker import STATUS_POLL_SECONDS, WorkerPool
     from .storage import Paths
 
     cfg = config_mod.load_config()
@@ -355,7 +355,7 @@ def _cmd_download_attachments(args: argparse.Namespace) -> None:
                     stats["done"] - done_at_start, total_for_type, stats["error"],
                 )
                 last_report = now
-            time.sleep(1)
+            time.sleep(STATUS_POLL_SECONDS)
     finally:
         pool.stop()
 
@@ -488,7 +488,7 @@ def _cmd_retry_all_failed(args: argparse.Namespace) -> None:
     )
     from .jobs import JobQueue
     from .rate_limiter import RateLimiter
-    from .worker import WorkerPool, desired_worker_count
+    from .worker import STATUS_POLL_SECONDS, WorkerPool, desired_worker_count
     from .storage import Paths
 
     is_attachment = lambda j: j.type == "download_task_attachment"  # noqa: E731
@@ -565,7 +565,7 @@ def _cmd_retry_all_failed(args: argparse.Namespace) -> None:
                 stats = queue.stats_for(lambda j: not is_attachment(j))
                 if stats["queued"] == 0 and stats["running"] == 0:
                     break
-                time.sleep(1)
+                time.sleep(STATUS_POLL_SECONDS)
         finally:
             pool.stop()
         elapsed = time.monotonic() - start

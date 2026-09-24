@@ -199,7 +199,7 @@ def _cmd_upload_attachments(args: argparse.Namespace) -> None:
     from .upload_attachments import HANDLERS, UploadContext, queue_pending_uploads
     from asana_migration.jobs import JobQueue
     from asana_migration.storage import Paths
-    from asana_migration.worker import WorkerPool
+    from asana_migration.worker import STATUS_POLL_SECONDS, WorkerPool
 
     # Saved so `format-docs`/`inspect-task` build image/download URLs against
     # the same file service the files actually went to, instead of silently
@@ -241,7 +241,7 @@ def _cmd_upload_attachments(args: argparse.Namespace) -> None:
                 log.info("Progress: %d uploaded so far | %d failed permanently",
                           stats["done"] - done_at_start, stats["error"])
                 last_report = now
-            time.sleep(1)
+            time.sleep(STATUS_POLL_SECONDS)
     finally:
         pool.stop()
 
@@ -262,7 +262,7 @@ def _cmd_build_tasks(args: argparse.Namespace) -> None:
     from .people import build_person_registry
     from asana_migration.jobs import JobQueue
     from asana_migration.storage import Paths
-    from asana_migration.worker import WorkerPool
+    from asana_migration.worker import STATUS_POLL_SECONDS, WorkerPool
 
     data_paths = Paths(root=config.DATA_DIR)
     queue = JobQueue(path=config.JOBS_PATH)
@@ -306,7 +306,7 @@ def _cmd_build_tasks(args: argparse.Namespace) -> None:
                     log.info("Progress: %d built so far | %d failed permanently",
                               stats["done"] - done_at_start, stats["error"])
                     last_report = now
-                time.sleep(1)
+                time.sleep(STATUS_POLL_SECONDS)
         finally:
             pool.stop()
         stats = queue.stats_for(is_pass1_job)

@@ -20,6 +20,7 @@ Two things still need doing entirely offline, from the export alone:
 
 from __future__ import annotations
 
+import html as html_lib
 import logging
 import re
 from pathlib import Path
@@ -31,25 +32,76 @@ log = logging.getLogger("padmasana_migration.people")
 PROFILE_GID_RE = re.compile(r'/profile/(\d+)"')
 USER_MENTION_RE = re.compile(r'<a\b[^>]*\bdata-asana-type=["\']user["\'][^>]*\bdata-asana-gid=["\'](\d+)["\'][^>]*>(.*?)</a>')
 USER_MENTION_ALT_RE = re.compile(r'<a\b[^>]*\bdata-asana-gid=["\'](\d+)["\'][^>]*\bdata-asana-type=["\']user["\'][^>]*>(.*?)</a>')
+ANCHOR_RE = re.compile(r"<a\b([^>]*)>(.*?)</a>", re.S)
+HREF_PROFILE_RE = re.compile(r'\bhref=["\'][^"\']*/profile/(\d+)')
+DATA_GID_RE = re.compile(r'\bdata-asana-gid=["\'](\d+)["\']')
+DATA_TYPE_USER_RE = re.compile(r'\bdata-asana-type=["\']user["\']')
+TAG_RE = re.compile(r"<[^>]+>")
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+# Asana's placeholder for people it no longer lets us see - never a real
+# identity, so never used to match two records to each other by name.
+PLACEHOLDER_NAMES = {"private user"}
 
 
-def build_person_registry(data_paths: Paths) -> dict[str, dict]:
-    """gid -> {"email":..., "name":...} for every person this export ever
-    names with a full record (team/project members and followers, task
-    assignees/followers/collaborators, and every comment's/story's
-    `created_by`). Read-only, built once up front and never mutated again -
-    safe to share across every worker thread without locking."""
-    registry: dict[str, dict] = {}
+class PersonRegistry(dict):
+    """gid -> {"email", "name", "source"}, plus `by_profile`: Asana profile
+    id (the number in `app.asana.com/0/profile/<id>` links) -> user gid.
+    The two are different ids for the same person - a rich-text mention
+    carries both (`href` + `data-asana-gid`), but assigned/unassigned
+    stories only carry the profile link, so this index is what turns one
+    back into the other."""
 
-    def add(person: dict | None) -> None:
+    def __init__(self) -> None:
+        super().__init__()
+        self.by_profile: dict[str, str] = {}
+
+
+def _anchor_text(raw: str) -> str:
+    return html_lib.unescape(TAG_RE.sub("", raw)).lstrip("@").strip()
+
+
+def build_person_registry(data_paths: Paths) -> PersonRegistry:
+    """gid -> {"email", "name", "source"} for every person this export ever
+    names: first everyone with a full record (team/project members and
+    followers, task assignees/followers/collaborators, every comment's/
+    story's `created_by`), then everyone who only shows up as a user link
+    inside rich text (mentions in notes/comments, the target of an
+    assigned/unassigned story). Read-only, built once up front and never
+    mutated again - safe to share across every worker thread without
+    locking."""
+    registry = PersonRegistry()
+    # profile id -> every anchor text seen for it, for links that carry no
+    # user gid (resolved after the scan, once every full record is known)
+    profile_texts: dict[str, set[str]] = {}
+
+    def add(person: dict | None, source: str = "record") -> None:
         if not person or not person.get("gid"):
             return
         gid = person["gid"]
         existing = registry.get(gid)
         if existing is None:
-            registry[gid] = {"email": person.get("email"), "name": person.get("name")}
-        elif not existing.get("email") and person.get("email"):
-            existing["email"] = person["email"]
+            registry[gid] = {"email": person.get("email"), "name": person.get("name"), "source": source}
+        else:
+            if source == "record":
+                existing["source"] = "record"
+            if not existing.get("email") and person.get("email"):
+                existing["email"] = person["email"]
+            if not existing.get("name") and person.get("name"):
+                existing["name"] = person["name"]
+
+    def scan_html(html: str | None) -> None:
+        if not html or "<a" not in html:
+            return
+        for attrs, inner in ANCHOR_RE.findall(html):
+            profile = HREF_PROFILE_RE.search(attrs)
+            gid = DATA_GID_RE.search(attrs) if DATA_TYPE_USER_RE.search(attrs) else None
+            text = _anchor_text(inner)
+            if gid:
+                add({"gid": gid.group(1), "name": text or None}, source="mention")
+                if profile:
+                    registry.by_profile[profile.group(1)] = gid.group(1)
+            elif profile:
+                profile_texts.setdefault(profile.group(1), set()).add(text)
 
     if not data_paths.root.exists():
         return registry
@@ -73,6 +125,7 @@ def build_person_registry(data_paths: Paths) -> dict[str, dict]:
                     add(member)
                 for follower in project.get("followers", []) or []:
                     add(follower)
+                scan_html(project.get("html_notes"))
                 for member in read_json(project_dir / "members.json", default=[]) or []:
                     add(member)
 
@@ -83,14 +136,64 @@ def build_person_registry(data_paths: Paths) -> dict[str, dict]:
                 add(task.get("assignee"))
                 for follower in task.get("followers", []) or []:
                     add(follower)
+                scan_html(task.get("html_notes"))
                 for collaborator in read_json(task_dir / "collaborators.json", default=[]) or []:
                     add(collaborator)
                 for comment in read_json(task_dir / "comments.json", default=[]) or []:
                     add(comment.get("created_by"))
+                    scan_html(comment.get("html_text"))
                 for story in read_json(task_dir / "stories.json", default=[]) or []:
                     add(story.get("created_by"))
+                    scan_html(story.get("html_text"))
 
+    _resolve_bare_profile_links(registry, profile_texts)
     return registry
+
+
+def _resolve_bare_profile_links(registry: PersonRegistry, profile_texts: dict[str, set[str]]) -> None:
+    """A profile link with no `data-asana-gid` next to it (assigned/
+    unassigned stories) names its person only by display text. Tie it to an
+    already-known person when that text is an email or a name belonging to
+    exactly one of them (several: left unresolved); matching nobody, it's
+    someone this export has no other record of, so they get their own entry
+    keyed by the profile id."""
+    by_email: dict[str, set[str]] = {}
+    by_name: dict[str, set[str]] = {}
+    for gid, person in registry.items():
+        if person.get("email"):
+            by_email.setdefault(person["email"].strip().lower(), set()).add(gid)
+        name = (person.get("name") or "").strip().lower()
+        if name and name not in PLACEHOLDER_NAMES:
+            by_name.setdefault(name, set()).add(gid)
+
+    for profile, texts in sorted(profile_texts.items()):
+        if profile in registry.by_profile:
+            continue
+        texts = {t for t in texts if t and "/profile/" not in t}
+        emails = {t.lower() for t in texts if EMAIL_RE.match(t)}
+        names = {t.lower() for t in texts - emails if t.lower() not in PLACEHOLDER_NAMES}
+
+        candidates: set[str] = set()
+        for e in emails:
+            candidates |= by_email.get(e, set())
+        if not candidates:
+            for n in names:
+                candidates |= by_name.get(n, set())
+        if len(candidates) == 1:
+            registry.by_profile[profile] = next(iter(candidates))
+            continue
+        if candidates:
+            # Same name on several known people - can't tell which, and it's
+            # almost certainly one of them, not someone new.
+            continue
+
+        name = next(iter(sorted(t for t in texts if not EMAIL_RE.match(t))), None) or next(iter(sorted(texts)), None)
+        registry[profile] = {
+            "email": next(iter(sorted(emails)), None),
+            "name": name,
+            "source": "profile_link",
+        }
+        registry.by_profile[profile] = profile
 
 
 def email_of(person: dict | None) -> str | None:
@@ -145,7 +248,7 @@ def resolve_profile_link_email(html_text: str | None, registry: dict[str, dict])
     gids = PROFILE_GID_RE.findall(html_text or "")
     if not gids:
         return None, None
-    target_gid = gids[-1]
+    target_gid = getattr(registry, "by_profile", {}).get(gids[-1], gids[-1])
     person = registry.get(target_gid)
     return (person.get("email") if person else None), target_gid
 
@@ -224,6 +327,7 @@ def build_user_map(
             "padmasana_name": pad_name or name,
             "profile_url": profile_url,
             "workspace": workspace,
+            "source": person.get("source") or "record",
             "status": status,
         }
 

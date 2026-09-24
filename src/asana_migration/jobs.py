@@ -19,6 +19,7 @@ processes genuinely can't clobber each other's writes (the bug behind the
 from __future__ import annotations
 
 import contextlib
+import math
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -89,7 +90,43 @@ class JobQueue:
         return jobs
 
     def _save(self, jobs: dict[int, Job]) -> None:
-        write_json(self.path, [asdict(j) for j in jobs.values()])
+        # Compact (no indent) on purpose: this file is rewritten whole on
+        # every mutation and holds 1e5+ jobs on a full crawl, so whitespace
+        # alone was a large share of each rewrite's cost.
+        write_json(self.path, [asdict(j) for j in jobs.values()], indent=None)
+
+    @staticmethod
+    def _add_many_locked(jobs: dict[int, Job], items, blocking_statuses: tuple[str, ...]) -> int:
+        """The shared body of `push_many`/`commit_batch`: appends `items`
+        ((type, payload, dedupe_key) tuples) to the already-loaded `jobs`,
+        skipping any whose dedupe_key is held by a job in
+        `blocking_statuses` (or by an earlier item in this same call).
+        Caller holds the lock and saves."""
+        existing_keys = {
+            j.dedupe_key for j in jobs.values()
+            if j.dedupe_key and j.status in blocking_statuses
+        }
+        next_id = max((j.id for j in jobs.values()), default=0) + 1
+        added = 0
+        for type_, payload, dedupe_key in items:
+            if dedupe_key and dedupe_key in existing_keys:
+                continue
+            jobs[next_id] = Job(id=next_id, type=type_, payload=payload, dedupe_key=dedupe_key)
+            if dedupe_key:
+                existing_keys.add(dedupe_key)
+            next_id += 1
+            added += 1
+        return added
+
+    @staticmethod
+    def _apply_failure(job: Job, error: str, now: float) -> None:
+        job.attempts += 1
+        job.error = str(error)[:2000]
+        if job.attempts >= MAX_ATTEMPTS:
+            job.status = "error"
+        else:
+            job.status = "queued"
+            job.not_before = now + min(60, 2**job.attempts)
 
     def push(self, type: str, payload: dict, dedupe_key: str | None = None, force: bool = False) -> Job | None:
         """Add a job, unless `dedupe_key` already names one that's queued,
@@ -129,20 +166,7 @@ class JobQueue:
         blocking_statuses = ("queued", "running") if requeue_done else ("queued", "running", "done")
         with self._locked():
             jobs = self._load()
-            existing_keys = {
-                j.dedupe_key for j in jobs.values()
-                if j.dedupe_key and j.status in blocking_statuses
-            }
-            next_id = max((j.id for j in jobs.values()), default=0) + 1
-            added = 0
-            for type_, payload, dedupe_key in items:
-                if dedupe_key and dedupe_key in existing_keys:
-                    continue
-                jobs[next_id] = Job(id=next_id, type=type_, payload=payload, dedupe_key=dedupe_key)
-                if dedupe_key:
-                    existing_keys.add(dedupe_key)
-                next_id += 1
-                added += 1
+            added = self._add_many_locked(jobs, items, blocking_statuses)
             if added:
                 self._save(jobs)
             return added
@@ -161,6 +185,77 @@ class JobQueue:
             self._save(jobs)
             return job
 
+    def pop_batch(self, max_n: int, share: int = 1) -> list[Job]:
+        """Claims up to `max_n` ready jobs (oldest first) in one locked
+        rewrite, instead of one rewrite per job like `pop_next`. Every
+        mutation rewrites the whole file, so at 1e5+ jobs that per-job cost
+        - not the Asana rate limit - was what capped throughput. `share` is
+        how many workers are pulling from this queue: a claim never takes
+        more than its fair share of what's ready, so when the queue runs
+        low one worker doesn't sit on everything while the rest idle.
+        Results go back via `commit_batch`."""
+        with self._locked():
+            jobs = self._load()
+            now = time.time()
+            candidates = [j for j in jobs.values() if j.status == "queued" and j.not_before <= now]
+            if not candidates:
+                return []
+            n = max(1, min(max_n, math.ceil(len(candidates) / max(1, share))))
+            candidates.sort(key=lambda j: j.id)
+            batch = candidates[:n]
+            for job in batch:
+                job.status = "running"
+                job.started_at = now
+            self._save(jobs)
+            return batch
+
+    def commit_batch(
+        self,
+        *,
+        done: list[tuple[int, float]] = (),
+        failed: list[tuple[int, str]] = (),
+        pushes: list[tuple[str, dict, str | None]] = (),
+        touch: list[int] = (),
+        release: list[int] = (),
+    ) -> int:
+        """Applies a `pop_batch` claim's results in one locked rewrite:
+        - `done`: (job_id, started_at) - marked done, with `started_at` set
+          to when that job actually began (not when its batch was claimed),
+          so `job-status`'s windowed save rate stays accurate.
+        - `failed`: (job_id, error) - same retry/backoff policy as `fail()`.
+        - `pushes`: jobs the batch's handlers queued, added with `push()`'s
+          dedupe rules (checked against the file *and* each other).
+        - `touch`: still-running job ids whose `started_at` is refreshed, so
+          a long batch isn't mistaken for a crashed one and reclaimed after
+          STALE_RUNNING_SECONDS.
+        - `release`: claimed-but-never-started job ids, put back to queued
+          (e.g. the worker was asked to stop mid-batch).
+        Returns how many `pushes` were actually added."""
+        with self._locked():
+            jobs = self._load()
+            now = time.time()
+            for job_id, started_at in done:
+                job = jobs.get(job_id)
+                if job:
+                    job.status = "done"
+                    job.error = None
+                    job.started_at = started_at
+            for job_id, error in failed:
+                job = jobs.get(job_id)
+                if job:
+                    self._apply_failure(job, error, now)
+            for job_id in touch:
+                job = jobs.get(job_id)
+                if job and job.status == "running":
+                    job.started_at = now
+            for job_id in release:
+                job = jobs.get(job_id)
+                if job and job.status == "running":
+                    job.status = "queued"
+            added = self._add_many_locked(jobs, pushes, ("queued", "running", "done"))
+            self._save(jobs)
+            return added
+
     def complete(self, job_id: int) -> None:
         with self._locked():
             jobs = self._load()
@@ -176,13 +271,7 @@ class JobQueue:
             job = jobs.get(job_id)
             if not job:
                 return
-            job.attempts += 1
-            job.error = str(error)[:2000]
-            if job.attempts >= MAX_ATTEMPTS:
-                job.status = "error"
-            else:
-                job.status = "queued"
-                job.not_before = time.time() + min(60, 2**job.attempts)
+            self._apply_failure(job, error, time.time())
             self._save(jobs)
 
     def prune_done(self, keep_last: int = 200) -> None:

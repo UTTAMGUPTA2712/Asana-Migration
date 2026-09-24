@@ -370,6 +370,11 @@ def h_import_task_comments(ctx: ImporterContext, payload: dict) -> None:
     project_dir = Path(payload["project_dir"])
     task_gid = payload["task_gid"]
     task_dir = ctx.paths.task_dir(workspace_dir, task_gid)
+    # Already saved by an earlier run (e.g. a job redone after a crash
+    # before its batch was committed - see worker.py) - nothing to refetch.
+    if (task_dir / "comments.json").exists():
+        log.info("Task %s: comments already saved - skipping, 0 API calls", task_gid)
+        return
     log.info("Task %s: fetching stories (comments + activity)...", task_gid)
     stories = list(ctx.client.get_stories_for_task(task_gid))
     comments = [s for s in stories if s.get("type") == "comment"]
@@ -393,6 +398,9 @@ def h_import_task_attachments(ctx: ImporterContext, payload: dict) -> None:
     project_dir = Path(payload["project_dir"])
     task_gid = payload["task_gid"]
     task_dir = ctx.paths.task_dir(workspace_dir, task_gid)
+    if (task_dir / "attachments.json").exists():  # same as comments above
+        log.info("Task %s: attachment links already saved - skipping, 0 API calls", task_gid)
+        return
     log.info("Task %s: fetching attachments...", task_gid)
     attachments = list(ctx.client.get_attachments_for_task(task_gid))
 
