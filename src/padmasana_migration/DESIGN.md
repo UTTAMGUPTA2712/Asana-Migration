@@ -335,11 +335,10 @@ task-collaboration/.../add-task-comment.validator.ts`). This project's
 contract: for a real file, `metadata` is exactly the JSON the
 file-service's `POST /files` hands back (`FileAggregateRootSchema`, see
 `openapi.yml`) — `upload_attachments.py` stores that response verbatim,
-`build_tasks.py` copies it through unchanged, no reshaping. Traceability
-back to the export rides along for free: the upload request sends
-`{"asana_gid": ..., "source": "asana"}` as `FileStoreRequest.metadata`,
-and the file-service's response echoes that same object back inside its
-own `metadata` field. A link-only attachment (`gdrive`/`external`,
+`build_tasks.py` copies it through unchanged, no reshaping. The upload
+sends no `FileStoreRequest.metadata` (the deployed file service answers
+500 to it, and padmasana-app never sends it either), so traceability back
+to the export is the record's own top-level `asana_gid`. A link-only attachment (`gdrive`/`external`,
 nothing ever uploaded) has no file-service response to store, so it keeps
 its own small shape instead:
 
@@ -349,10 +348,10 @@ its own small shape instead:
   "id": 123,
   "uuid": "<file-service's returned uuid>",
   "disk": "local",
-  "path": "asana-migration/attachments",
+  "path": "/",
   "name": "image.png",
   "checksum": "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed",
-  "metadata": { "asana_gid": "1211656684915713", "source": "asana" },
+  "metadata": null,
   "created_at": "2024-01-25T16:03:35.000000Z",
   "updated_at": "2024-01-25T16:03:35.000000Z"
 }
@@ -432,9 +431,10 @@ N` in flight at once, via `WorkerPool`):
 
 - **Real file** (`host: "asana"`, already downloaded to `local_path`) —
   `POST <file_service_url>/files` as `multipart/form-data`, per
-  `openapi.yml`'s `FileStoreRequest`: `file` (the binary), `path` (fixed,
-  `asana-migration/attachments`), `name` (the original filename),
-  `metadata: {"asana_gid": ..., "source": "asana"}`. Whatever JSON comes
+  `openapi.yml`'s `FileStoreRequest`: `file` (the binary), `path`
+  (`--file-service-path`, else `NEXT_PUBLIC_FILES_STORAGE_PATH`, else `/`),
+  `name` (the original filename) - the same
+  three fields padmasana-app's own upload sends. Whatever JSON comes
   back (`FileAggregateRootSchema`) is saved verbatim as this attachment's
   `metadata` (§5.7).
 - **Link only** (`gdrive`/`external`) — nothing to upload; carried over as

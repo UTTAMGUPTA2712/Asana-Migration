@@ -469,8 +469,15 @@ def queue_pending_attachment_downloads(ctx: ImporterContext) -> tuple[int, int]:
     can run as its own pass any time after (or during, on a re-run) the
     main import - see the `download-attachments` CLI command.
 
+    Queues everything with one `push_many` call rather than one `push()`
+    per attachment: `push()` loads, dedupe-scans and rewrites the whole jobs
+    file each time, which on a full crawl's queue (1e5 jobs, ~50 MB) cost
+    ~1s per attachment - hours of silent scanning before a single download
+    started.
+
     Returns (queued, already_done) purely for the caller's log line."""
-    queued = already_done = 0
+    already_done = 0
+    items: list[tuple[str, dict, str | None]] = []
     for attachments_path in ctx.paths.root.glob("*/tasks/*/attachments.json"):
         task_dir = attachments_path.parent
         workspace_dir = task_dir.parent.parent
@@ -483,13 +490,12 @@ def queue_pending_attachment_downloads(ctx: ImporterContext) -> tuple[int, int]:
             if local_path and (task_dir / local_path).exists():
                 already_done += 1
                 continue
-            job = ctx.queue.push(
+            items.append((
                 "download_task_attachment",
                 {"workspace_dir": str(workspace_dir), "task_gid": task_gid, "attachment_gid": att["gid"]},
-                dedupe_key=f"download_attachment:{att['gid']}",
-            )
-            if job:
-                queued += 1
+                f"download_attachment:{att['gid']}",
+            ))
+    queued = ctx.queue.push_many(items) if items else 0
     return queued, already_done
 
 
@@ -651,7 +657,7 @@ def find_stuck_attachment_downloads(paths: Paths, queue: JobQueue) -> list[Job]:
     check for these before asking for a token - see that command's own
     no-op-avoidance comment."""
     return [
-        job for job in queue.all_jobs()
+        job for job in queue.all_jobs(include_archived=True)
         if job.type == "download_task_attachment"
         and job.status == "done"
         and not _attachment_actually_downloaded(paths, job.payload)

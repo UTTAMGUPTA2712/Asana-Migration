@@ -196,7 +196,7 @@ def _cmd_upload_attachments(args: argparse.Namespace) -> None:
 
     from . import config
     from .file_service_client import FileServiceClient
-    from .upload_attachments import HANDLERS, UploadContext, queue_pending_uploads
+    from .upload_attachments import DEFAULT_UPLOAD_PATH, HANDLERS, UploadContext, queue_pending_uploads
     from asana_migration.jobs import JobQueue
     from asana_migration.storage import Paths
     from asana_migration.worker import STATUS_POLL_SECONDS, WorkerPool
@@ -205,12 +205,16 @@ def _cmd_upload_attachments(args: argparse.Namespace) -> None:
     # the same file service the files actually went to, instead of silently
     # falling back to their localhost default when the flag is left off.
     # The token is deliberately never saved.
-    config.save_padmasana_config(file_service_url=args.file_service_url.rstrip("/"))
+    # The path is saved too, so a re-run without the flag keeps uploading
+    # under the same path instead of silently switching back to the default.
+    upload_path = args.file_service_path or config.get_padmasana_config().get("file_service_path") or DEFAULT_UPLOAD_PATH
+    config.save_padmasana_config(file_service_url=args.file_service_url.rstrip("/"), file_service_path=upload_path)
 
     data_paths = Paths(root=config.DATA_DIR)
     queue = JobQueue(path=config.JOBS_PATH)
     file_client = FileServiceClient(args.file_service_url, token=args.file_service_token)
-    ctx = UploadContext(file_client=file_client, data_paths=data_paths, build_dir=config.BUILD_DIR, queue=queue)
+    ctx = UploadContext(file_client=file_client, data_paths=data_paths, build_dir=config.BUILD_DIR, queue=queue,
+                        upload_path=upload_path)
 
     log.info("Scanning %s for attachments not uploaded yet...", config.DATA_DIR)
     queued, already_done = queue_pending_uploads(data_paths, config.BUILD_DIR, queue)
@@ -375,6 +379,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     upload_attachments.add_argument("--file-service-url", required=True, help="e.g. http://localhost:8080")
     upload_attachments.add_argument("--file-service-token", help="Sent as Authorization: Bearer <token> if given (DESIGN.md §2).")
+    upload_attachments.add_argument(
+        "--file-service-path",
+        help="Value sent as the file service's `path` field (any string; e.g. padmasana/develop). "
+             "Saved to var/config.json; default: env NEXT_PUBLIC_FILES_STORAGE_PATH, else \"/\" "
+             "(same as padmasana-app).",
+    )
     upload_attachments.add_argument("--concurrency", type=int, default=8, metavar="N")
     upload_attachments.add_argument("-v", "--verbose", action="store_true")
     upload_attachments.set_defaults(func=_cmd_upload_attachments)

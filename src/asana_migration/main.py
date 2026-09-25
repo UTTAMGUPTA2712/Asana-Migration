@@ -298,6 +298,10 @@ def _cmd_download_attachments(args: argparse.Namespace) -> None:
     ctx = ImporterContext(client=client, paths=Paths(), queue=JobQueue())
     is_download_job = lambda j: j.type == "download_task_attachment"  # noqa: E731
 
+    if args.archive_done:
+        archived, archive_path = ctx.queue.archive_done()
+        log.info("Archived %d finished job(s) to %s (job-status still counts them).", archived, archive_path)
+
     log.info("Scanning ./data for attachments not downloaded yet...")
     queued, already_done = queue_pending_attachment_downloads(ctx)
     # `queued` only counts jobs *this scan* newly added - JobQueue.push()'s
@@ -740,7 +744,7 @@ def _cmd_job_status(args: argparse.Namespace) -> None:
     from .jobs import JobQueue
 
     queue = JobQueue(path=JOBS_PATH)
-    jobs = queue.all_jobs()
+    jobs = queue.all_jobs(include_archived=True)
     if not jobs:
         hint = ("run one of padmasana_migration's scripts (e.g. `padmasana-build-tasks`) first"
                  if args.padmasana else "run `import-all` or `serve` first")
@@ -764,7 +768,10 @@ def _cmd_job_status(args: argparse.Namespace) -> None:
 
     eta_min = remaining / recent_rate if recent_rate > 0 else None
 
-    print(f"Job queue: {JOBS_PATH}  (checked {time.strftime('%Y-%m-%d %H:%M:%S %Z')})\n")
+    print(f"Job queue: {JOBS_PATH}  (checked {time.strftime('%Y-%m-%d %H:%M:%S %Z')})")
+    for archive in queue.archive_paths():
+        print(f"  + archive: {archive}")
+    print()
 
     print(_progress_bar(done_n, total), f" {done_n}/{total} done, {remaining} left")
     print(f"  done: {done_n:>6}   queued: {queued_n:>6}   running: {running_n:>6}   error: {error_n:>6}\n")
@@ -838,6 +845,11 @@ def build_parser() -> argparse.ArgumentParser:
                                        help=f"How many attachments to download at once (default {DEFAULT_DOWNLOAD_CONCURRENCY}). "
                                             "Bandwidth-bound, not request-rate-bound - unrelated to --rate-limit, "
                                             "raise it freely to use more of your network/disk throughput.")
+    download_attachments.add_argument("--archive-done", action="store_true",
+                                       help="First move finished jobs out of var/jobs.json into a new "
+                                            "var/jobs-N.json archive. After a full import it holds ~1e5 done "
+                                            "jobs that every queue read/write re-parses, slowing all workers "
+                                            "down; job-status still reads the archives.")
     download_attachments.add_argument("-v", "--verbose", action="store_true",
                                        help="Log every HTTP request/download, not just the narrative summary.")
     download_attachments.set_defaults(func=_cmd_download_attachments)

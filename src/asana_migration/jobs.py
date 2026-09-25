@@ -274,13 +274,41 @@ class JobQueue:
             self._apply_failure(job, error, time.time())
             self._save(jobs)
 
-    def prune_done(self, keep_last: int = 200) -> None:
+    def archive_paths(self) -> list:
+        """Every archive file `archive_done` has written for this queue
+        (`jobs-1.json`, `jobs-2.json`, ... next to `jobs.json`), oldest first."""
+        found = []
+        for p in self.path.parent.glob(f"{self.path.stem}-*{self.path.suffix}"):
+            n = p.stem[len(self.path.stem) + 1:]
+            if n.isdigit():
+                found.append((int(n), p))
+        return [p for _, p in sorted(found)]
+
+    def archive_done(self) -> tuple[int, object]:
+        """Moves every `done` job out of the live queue file into a new
+        numbered archive file next to it (`jobs-1.json`, then `jobs-2.json`,
+        ...), so the file every worker re-parses on each mutation stays
+        small without losing history - `all_jobs(include_archived=True)`
+        (used by `job-status`) still reads them. The highest-id job always
+        stays live, even if done, so new job ids never reuse an archived
+        one's. Returns (jobs archived, archive path or None)."""
         with self._locked():
             jobs = self._load()
-            done = sorted((j for j in jobs.values() if j.status == "done"), key=lambda j: j.id)
-            for job in (done[:-keep_last] if keep_last else done):
+            max_id = max(jobs, default=0)
+            done = [j for j in sorted(jobs.values(), key=lambda j: j.id)
+                    if j.status == "done" and j.id != max_id]
+            if not done:
+                return 0, None
+            existing = self.archive_paths()
+            last_n = int(existing[-1].stem[len(self.path.stem) + 1:]) if existing else 0
+            archive = self.path.with_name(f"{self.path.stem}-{last_n + 1}{self.path.suffix}")
+            # Written before the live file drops them, so a crash in between
+            # can only duplicate history, never lose it.
+            write_json(archive, [asdict(j) for j in done], indent=None)
+            for job in done:
                 del jobs[job.id]
             self._save(jobs)
+            return len(done), archive
 
     def stats(self) -> dict:
         with self._locked():
@@ -290,14 +318,18 @@ class JobQueue:
                 out[job.status] = out.get(job.status, 0) + 1
             return out
 
-    def all_jobs(self) -> list[Job]:
+    def all_jobs(self, include_archived: bool = False) -> list[Job]:
         """A read-only snapshot of every job, id-ordered - for reporting
         (e.g. `job-status`) that needs more than the aggregate counts
         `stats()`/`stats_for()` give, like per-type breakdowns or throughput
-        derived from each job's `started_at`."""
+        derived from each job's `started_at`. `include_archived` adds the
+        done jobs `archive_done` moved out into `jobs-N.json` files."""
         with self._locked():
-            jobs = self._load()
-            return sorted(jobs.values(), key=lambda j: j.id)
+            jobs = list(self._load().values())
+            if include_archived:
+                for archive in self.archive_paths():
+                    jobs.extend(Job(**item) for item in read_json(archive, default=[]) or [])
+            return sorted(jobs, key=lambda j: j.id)
 
     def pending_count_for(self, predicate) -> int:
         with self._locked():
@@ -332,7 +364,7 @@ class JobQueue:
         wedge a dedupe key forever) and that fresh job has since succeeded
         or is in flight. That leaves the original behind as a permanent
         orphan: nothing ever revisits it (there's no pruning for `error`
-        rows, only `prune_done`), so it just sits there claiming the same
+        rows, only `archive_done`), so it just sits there claiming the same
         work is still broken - inflating `job-status`'s error count and
         `retry-all`'s "still failing" report for something that isn't
         actually still failing.

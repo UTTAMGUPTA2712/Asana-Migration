@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import threading
 import uuid
 from dataclasses import dataclass
@@ -42,7 +43,10 @@ from .file_service_client import FileServiceClient
 
 log = logging.getLogger("padmasana_migration.upload_attachments")
 
-UPLOAD_PATH = "asana-migration/attachments"
+# The file service's `path` field - just a label, any string is accepted.
+# Same fallback as padmasana-app's own upload (`use-upload-file.ts`:
+# `NEXT_PUBLIC_FILES_STORAGE_PATH || "/"`). `--file-service-path` overrides it.
+DEFAULT_UPLOAD_PATH = os.environ.get("NEXT_PUBLIC_FILES_STORAGE_PATH") or "/"
 
 try:
     import fcntl
@@ -69,6 +73,7 @@ class UploadContext:
     data_paths: Paths
     build_dir: Path
     queue: JobQueue
+    upload_path: str = DEFAULT_UPLOAD_PATH
 
 
 def _build_out_path(build_dir: Path, task_gid: str) -> Path:
@@ -146,9 +151,8 @@ def h_upload_attachment(ctx: UploadContext, payload: dict) -> None:
         log.info("Task %s: uploading attachment %s '%s'...", task_gid, attachment_gid, att.get("name"))
         response = ctx.file_client.upload_file(
             file_path=task_data_dir / local_path,
-            path=UPLOAD_PATH,
+            path=ctx.upload_path,
             name=att.get("name") or attachment_gid,
-            metadata={"asana_gid": attachment_gid, "source": "asana"},
         )
         record = {"asana_gid": attachment_gid, "host": "asana", "metadata": response}
     else:

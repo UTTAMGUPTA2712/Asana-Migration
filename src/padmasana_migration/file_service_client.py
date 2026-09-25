@@ -9,7 +9,6 @@ file-service uploads"); concurrency is bounded entirely by
 
 from __future__ import annotations
 
-import json
 import mimetypes
 
 import requests
@@ -31,7 +30,7 @@ class FileServiceClient:
             # placeholder.
             self.session.headers.update({"Authorization": f"Bearer {token}"})
 
-    def upload_file(self, *, file_path, path: str, name: str, metadata: dict) -> dict:
+    def upload_file(self, *, file_path, path: str, name: str) -> dict:
         """Uploads one real file's bytes. Returns the verbatim
         `FileAggregateRootSchema` JSON body - callers store this whole and
         untouched as the eventual `attachment`/`comment_attachment` row's
@@ -43,7 +42,11 @@ class FileServiceClient:
         content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
         with open(file_path, "rb") as fh:
             files = {"file": (name, fh, content_type)}
-            data = {"path": path, "name": name, "metadata": json.dumps(metadata)}
+            # Exactly the fields padmasana-app's own upload sends (see its
+            # `use-upload-file.ts`): file, name, path. No `metadata` - a JSON
+            # string there made this file service answer 500 on every upload,
+            # and nothing downstream reads it back (only the returned uuid/name).
+            data = {"path": path, "name": name}
             resp = self.session.post(url, files=files, data=data, timeout=self.timeout)
         if resp.status_code not in (200, 201):
             raise FileServiceError(f"POST {url} -> {resp.status_code}: {resp.text[:500]}")
