@@ -225,10 +225,11 @@ def create_app() -> Flask:
             state.require_client()
             members = ensure_team_members(state.ctx, team_dir, team_gid)
 
+        jobs = state.queue.all_jobs()
         projects = []
         for p in cached:
             project_dir = state.paths.project_dir(workspace_dir, p["gid"], p.get("name"))
-            view = project_view(state.queue, project_dir, p["gid"])
+            view = project_view(state.queue, project_dir, p["gid"], jobs=jobs)
             projects.append({**p, **view})
         return jsonify({
             "team": read_json(team_dir / "team.json"),

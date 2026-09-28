@@ -792,21 +792,32 @@ HANDLERS = {
 # calling Asana, by combining the on-disk _meta.json with the queue's own
 # view of what's still pending for that project.
 
-def project_view(queue: JobQueue, project_dir: Path, project_gid: str | None = None) -> dict:
+def project_view(
+    queue: JobQueue, project_dir: Path, project_gid: str | None = None, jobs: list | None = None,
+) -> dict:
+    """`jobs`: an optional `queue.all_jobs()` snapshot. Callers rendering many
+    projects at once should pass one - otherwise every project takes the
+    queue's file lock twice, and with the worker pool polling that same lock
+    every second a 90-project team page can starve for minutes."""
     def matches(job) -> bool:
         payload = job.payload
         return payload.get("project_dir") == str(project_dir) or (
             project_gid is not None and payload.get("project_gid") == project_gid
         )
 
+    def pending_count() -> int:
+        if jobs is None:
+            return queue.pending_count_for(matches)
+        return sum(1 for j in jobs if j.status in ("queued", "running") and matches(j))
+
     meta = Meta(project_dir).read()
     project = read_json(project_dir / "project.json", default={}) or {}
     if not meta:
-        pending = queue.pending_count_for(matches)
+        pending = pending_count()
         status = "importing" if pending else "not_imported"
         return {"status": status, "project": project, "pending_jobs": pending, "error_jobs": 0}
 
-    pending = queue.pending_count_for(matches)
+    pending = pending_count()
     status = meta.get("status", "not_imported")
     if status == "importing" and pending == 0:
         meta = Meta(project_dir).update(status="complete", completed_at=now_iso())
@@ -826,7 +837,7 @@ def project_view(queue: JobQueue, project_dir: Path, project_gid: str | None = N
     if meta.get("tasks_imported") != accurate_imported or meta.get("comments_imported") != accurate_comments:
         meta = Meta(project_dir).update(tasks_imported=accurate_imported, comments_imported=accurate_comments)
 
-    errors = queue.errors_for(matches)
+    errors = queue.errors_for(matches) if jobs is None else [j for j in jobs if j.status == "error" and matches(j)]
     return {
         "status": status,
         "meta": meta,
