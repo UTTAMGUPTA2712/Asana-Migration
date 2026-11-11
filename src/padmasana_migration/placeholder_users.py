@@ -176,6 +176,29 @@ def create_placeholder_users(build_dir: Path) -> list[dict]:
         }
         created.append(store[gid])
 
+    # Fallback actor for rows Asana attributes to nobody (rules, integrations,
+    # API imports) where padmasana's column is NOT NULL - task.created_by,
+    # comment.author_id, attachment.uploaded_by, task_activity_log.actor_id.
+    # Not an Asana user, so it's never in user_to_asana_gid.json.
+    from .people import SYSTEM_USER_KEY
+    system = store.setdefault(SYSTEM_USER_KEY, {
+        "user_reference_code": _code_for("system"),
+        "email": f"asana.migration@{domain}",
+        "name": "Asana",
+        "last_name": "Migration",
+        "profile_url": None,
+        "workspace": ws,
+        "asana_gid": None,
+        "placeholder": True,
+        "placeholder_kind": "system",
+        "placeholder_index": 0,
+    })
+    if system["email"].lower() in known_emails and not any(
+        p.get("user_reference_code") == system["user_reference_code"] for p in padmasana_users
+    ):
+        raise SystemExit(f"system user email {system['email']} already belongs to a real padmasana user")
+    created.append(system)
+
     write_json(store_path, store)
 
     # padmasana_users.json entries: same keys the Firebase client returns.

@@ -269,6 +269,51 @@ def resolve_profile_link_email(html_text: str | None, registry: dict[str, dict])
     return (person.get("email") if person else None), target_gid
 
 
+SYSTEM_USER_KEY = "__system__"  # key of the fallback user in build/placeholder_users.json
+
+
+class RefResolver:
+    """Asana email (as written in every build/ row) -> padmasana
+    `user_reference_code`.
+
+    The build carries Asana's emails, which for ~70 people differ from their
+    padmasana email (`x@ctdesarrollo.org` vs `x@funiber.org`), so the seeder
+    can't match on email. `user_to_asana_gid.json` already ties every Asana
+    user to the right code - this indexes it by every email it knows for them.
+
+    `system_ref` is the fallback user (`padmasana-create-placeholder-users`)
+    for rows whose Asana actor is unknown (rules, integrations, ...) but whose
+    padmasana column is NOT NULL."""
+
+    def __init__(self, build_dir: Path) -> None:
+        self.by_email: dict[str, str] = {}
+        for u in read_json(build_dir / "padmasana_users.json", default=[]) or []:
+            if u.get("email") and u.get("user_reference_code"):
+                self.by_email[u["email"].strip().lower()] = u["user_reference_code"]
+        # Map entries win over padmasana_users: they're keyed by the Asana
+        # identity, which is what the build's emails are.
+        for u in (read_json(build_dir / "user_to_asana_gid.json", default={}) or {}).values():
+            ref = u.get("user_reference_code")
+            if not ref:
+                continue
+            for key in ("email", "matched_real_email"):
+                if u.get(key):
+                    self.by_email[u[key].strip().lower()] = ref
+        system = (read_json(build_dir / "placeholder_users.json", default={}) or {}).get(SYSTEM_USER_KEY) or {}
+        self.system_ref: str | None = system.get("user_reference_code")
+        self.loaded = bool(self.by_email)
+
+    def ref(self, email: str | None) -> str | None:
+        return self.by_email.get(email.strip().lower()) if email else None
+
+    def ref_or_system(self, *emails: str | None) -> str | None:
+        """First email that resolves wins; none -> the system user."""
+        for email in emails:
+            if (code := self.ref(email)):
+                return code
+        return self.system_ref
+
+
 def load_user_map(build_dir: Path) -> dict[str, dict]:
     """Loads build/user_to_asana_gid.json if present, returning a dict of asana_gid -> user dict."""
     path = build_dir / "user_to_asana_gid.json"

@@ -711,6 +711,16 @@ def format_all_tasks(
         total_tasks += 1
         raw_desc = task.get("description_html") or task.get("description") or ""
         formatted_desc = format_html_content(raw_desc, ctx)
+        # Link-only Asana attachments (Drive/external) referenced nowhere
+        # else - build-tasks carries them in `links`; they become links at the
+        # end of the description. Skipped if already there (re-runs).
+        for link in task.get("links") or []:
+            if link["url"] in formatted_desc or _esc(link["url"]) in formatted_desc:
+                continue
+            # Through the formatter itself, so the markup is exactly what a
+            # re-run would produce (attribute order etc.) - stable on re-runs.
+            formatted_desc += format_html_content(
+                f'<p><a href="{_esc(link["url"])}">{_esc_text(link.get("name") or link["url"])}</a></p>', ctx)
 
         if not dry_run:
             task["description"] = formatted_desc
@@ -742,3 +752,148 @@ def format_all_tasks(
             write_json(flat_comments_path, all_comments_updated)
 
     return total_tasks, total_comments
+
+
+# --- record formatting (non-HTML) -------------------------------------------
+#
+# Field values the build keeps in Asana's terms that padmasana stores
+# differently. Done here, after `build-tasks`' compile step, so the build
+# scripts stay a faithful copy of Asana and every padmasana-specific
+# conversion lives in one place. Every step is idempotent - re-running
+# format-docs leaves already-converted values as they are.
+
+_BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+_LEXORANK_WIDTH = 6
+_LEXORANK_SPACE = 36 ** _LEXORANK_WIDTH
+
+
+def _base36(n: int, width: int) -> str:
+    digits = []
+    while n:
+        n, r = divmod(n, 36)
+        digits.append(_BASE36[r])
+    return "".join(reversed(digits)).rjust(width, "0")
+
+
+def lexorank_sequence(count: int) -> list[str]:
+    """`count` ascending LexoRank values (`0|xxxxxx:`, the same format the
+    `lexorank` npm package padmasana-service uses - `LexoRank.parse()`
+    accepts them and `between()`/`genNext()` work on them). Spread evenly
+    over the whole rank space rather than packed like repeated `genNext()`,
+    so users can reorder/insert between migrated items for a long time
+    before any rebalancing is needed."""
+    step = _LEXORANK_SPACE // (count + 1)
+    return [f"0|{_base36(step * (i + 1), _LEXORANK_WIDTH)}:" for i in range(count)]
+
+
+def _order_sort_key(row: dict):
+    order = row.get("order")
+    # ints from the build, or LexoRank strings from an earlier format-docs
+    # run - both sort correctly within their own kind.
+    return (0, order, "") if isinstance(order, int) else (1, 0, str(order or ""))
+
+
+def _rank_groups(rows: list[dict], group_key: str) -> int:
+    groups: dict[str, list[dict]] = {}
+    for row in rows:
+        groups.setdefault(row.get(group_key), []).append(row)
+    for group in groups.values():
+        group.sort(key=_order_sort_key)
+        for row, rank in zip(group, lexorank_sequence(len(group))):
+            row["order"] = rank
+    return len(rows)
+
+
+# Asana tag color name -> (background, text) as padmasana-app renders them:
+# `tag.color` / `tag.text_color` are used directly as CSS colors
+# (padmasana-app get-tag-colors.ts). "none" -> the app's own default chip.
+ASANA_TAG_COLORS: dict[str, tuple[str, str]] = {
+    "none": ("#eeeeee", "#424242"),
+    "red": ("#e8384f", "#ffffff"),
+    "orange": ("#fd612c", "#ffffff"),
+    "yellow-orange": ("#fd9a00", "#ffffff"),
+    "yellow": ("#eec300", "#424242"),
+    "yellow-green": ("#a4cf30", "#424242"),
+    "green": ("#62d26f", "#ffffff"),
+    "blue-green": ("#37c5ab", "#ffffff"),
+    "aqua": ("#20aaea", "#ffffff"),
+    "blue": ("#4186e0", "#ffffff"),
+    "indigo": ("#7a6ff0", "#ffffff"),
+    "purple": ("#aa62e3", "#ffffff"),
+    "magenta": ("#e362e3", "#ffffff"),
+    "hot-pink": ("#ea4e9d", "#ffffff"),
+    "pink": ("#fc91ad", "#424242"),
+    "cool-gray": ("#8da3a6", "#ffffff"),
+    # Asana's legacy palette
+    "dark-pink": ("#b5277a", "#ffffff"),
+    "dark-green": ("#287a3a", "#ffffff"),
+    "dark-blue": ("#2a5aa8", "#ffffff"),
+    "dark-red": ("#b5212f", "#ffffff"),
+    "dark-teal": ("#1f7a7a", "#ffffff"),
+    "dark-brown": ("#7a4a1f", "#ffffff"),
+    "dark-orange": ("#c4561c", "#ffffff"),
+    "dark-purple": ("#6a3fa0", "#ffffff"),
+    "dark-warm-gray": ("#5e5a55", "#ffffff"),
+    "light-pink": ("#f9c6dc", "#424242"),
+    "light-green": ("#c4e8b6", "#424242"),
+    "light-blue": ("#c2d9f5", "#424242"),
+    "light-red": ("#f7c4c4", "#424242"),
+    "light-teal": ("#bce8e3", "#424242"),
+    "light-brown": ("#e3cdb3", "#424242"),
+    "light-orange": ("#fad3b4", "#424242"),
+    "light-purple": ("#dccaf2", "#424242"),
+    "light-warm-gray": ("#e0dcd6", "#424242"),
+}
+
+
+def _format_tag_color(tag: dict) -> bool:
+    color = (tag.get("color") or "").strip()
+    if color.startswith("#"):
+        return False  # already converted
+    if color.lower() not in ASANA_TAG_COLORS:
+        log.warning("Tag %s: unknown Asana color %r - using the default chip colors", tag.get("uuid"), color)
+    bg, fg = ASANA_TAG_COLORS.get(color.lower(), ASANA_TAG_COLORS["none"])
+    tag["color"], tag["text_color"] = bg, fg
+    return True
+
+
+def format_build_records(build_dir: Path, dry_run: bool = False) -> dict[str, int]:
+    """Converts, in place, the flat build/ files' non-HTML fields to padmasana's
+    representation:
+
+    - `order` (sections per board, section_tasks per board_section): Asana
+      position ints -> LexoRank strings (padmasana's `OrderValue`).
+    - tag `color`: Asana color names -> CSS hex, plus a matching `text_color`.
+    - team/board `privacy`: `PRIVATE` -> padmasana's lowercase enum value.
+    """
+    counts: dict[str, int] = {}
+
+    def load(name: str) -> list[dict] | None:
+        rows = read_json(build_dir / name, default=None)
+        if rows is None:
+            log.warning("%s/%s missing - skipped", build_dir, name)
+        return rows
+
+    def save(name: str, rows: list[dict]) -> None:
+        if not dry_run:
+            write_json(build_dir / name, rows)
+
+    if (sections := load("sections.json")) is not None:
+        counts["sections_ranked"] = _rank_groups(sections, "board_uuid")
+        save("sections.json", sections)
+    if (section_tasks := load("section_tasks.json")) is not None:
+        counts["section_tasks_ranked"] = _rank_groups(section_tasks, "board_section_uuid")
+        save("section_tasks.json", section_tasks)
+    if (tags := load("tags.json")) is not None:
+        counts["tag_colors"] = sum(_format_tag_color(t) for t in tags)
+        save("tags.json", tags)
+    for name in ("teams.json", "boards.json"):
+        if (rows := load(name)) is not None:
+            changed = 0
+            for row in rows:
+                if row.get("privacy") and row["privacy"] != row["privacy"].lower():
+                    row["privacy"] = row["privacy"].lower()
+                    changed += 1
+            counts[f"{name.removesuffix('.json')}_privacy"] = changed
+            save(name, rows)
+    return counts

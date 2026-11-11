@@ -18,7 +18,7 @@ from pathlib import Path
 
 from asana_migration.storage import Paths, read_json, write_json
 
-from .people import build_person_registry, resolve_owner_email
+from .people import RefResolver, build_person_registry, resolve_owner_email
 
 log = logging.getLogger("padmasana_migration.build_teams_and_boards")
 
@@ -31,6 +31,12 @@ log = logging.getLogger("padmasana_migration.build_teams_and_boards")
 OTHER_PROJECTS_TEAM_GID_PREFIX = "other-projects-"
 
 
+# Every tag Asana has, deduped by name - the reference set build_tasks.py
+# resolves task tags against. `tags.json` (what gets seeded) is written later
+# by `build_tasks.compile_build`, filtered down to tags some task actually uses.
+ALL_TAGS_FILE = "all_tags.json"
+
+
 def _existing_uuids(build_dir: Path | None, filename: str) -> dict[str, str]:
     """asana_gid -> uuid already written by a previous run of this script,
     if any - reused so re-running it (e.g. to pick up newly-imported teams/
@@ -38,7 +44,12 @@ def _existing_uuids(build_dir: Path | None, filename: str) -> dict[str, str]:
     real padmasana instance (same reasoning as `build_tasks._stable_uuid`)."""
     if build_dir is None:
         return {}
-    return {row["asana_gid"]: row["uuid"] for row in read_json(build_dir / filename, default=[]) or [] if row.get("asana_gid")}
+    out: dict[str, str] = {}
+    for row in read_json(build_dir / filename, default=[]) or []:
+        for gid in [row.get("asana_gid"), *(row.get("alias_asana_gids") or [])]:
+            if gid:
+                out[gid] = row["uuid"]
+    return out
 
 
 def build(data_paths: Paths, team_owner_overrides: dict[str, str] | None = None, build_dir: Path | None = None) -> dict:
@@ -48,12 +59,18 @@ def build(data_paths: Paths, team_owner_overrides: dict[str, str] | None = None,
     uuids, see `_existing_uuids`) - never written to until `write_output`."""
     team_owner_overrides = team_owner_overrides or {}
     registry = build_person_registry(data_paths)
+    resolver = RefResolver(build_dir) if build_dir is not None else None
+    if resolver is None or not resolver.loaded:
+        log.warning("No user map in build/ - *_reference_code fields will be null. Run import-users, "
+                    "create-placeholder-users and map-users first.")
+    ref = (lambda email: resolver.ref(email)) if resolver else (lambda email: None)
 
     existing_team_uuids = _existing_uuids(build_dir, "teams.json")
     existing_board_uuids = _existing_uuids(build_dir, "boards.json")
     existing_section_uuids = _existing_uuids(build_dir, "sections.json")
 
-    tags = _build_tags(data_paths, existing_tag_uuids=_existing_uuids(build_dir, "tags.json"))
+    existing_tag_uuids = _existing_uuids(build_dir, ALL_TAGS_FILE) or _existing_uuids(build_dir, "tags.json")
+    tags = _build_tags(data_paths, existing_tag_uuids=existing_tag_uuids)
     teams: list[dict] = []
     boards: dict[str, dict] = {}  # project_gid -> board (deduped - a project can be on >1 team)
     sections: list[dict] = []
@@ -63,6 +80,7 @@ def build(data_paths: Paths, team_owner_overrides: dict[str, str] | None = None,
 
     board_uuid_by_project_gid: dict[str, str] = {}
     seen_board_team_pairs: set[tuple[str, str]] = set()
+    seen_team_members: set[tuple[str, str]] = set()
 
     if not data_paths.root.exists():
         log.warning("No data directory at %s - nothing to build.", data_paths.root)
@@ -102,12 +120,19 @@ def build(data_paths: Paths, team_owner_overrides: dict[str, str] | None = None,
                         "description": team_json.get("description") or "",
                         "privacy": "PRIVATE",
                         "owner_email": owner_email,
+                        "owner_reference_code": ref(owner_email),
                     })
                     log.info("Team '%s' (%s): owner=%s (%s)", team_json.get("name"), team_gid, owner_email, source)
                     for member in members:
                         email = member.get("email")
-                        if email:
-                            team_members.append({"team_uuid": team_uuid, "workspace_member_email": email})
+                        if email and (team_uuid, email.lower()) not in seen_team_members:
+                            seen_team_members.add((team_uuid, email.lower()))
+                            team_members.append({
+                                "team_uuid": team_uuid,
+                                "workspace_member_email": email,
+                                "workspace_member_reference_code": ref(email),
+                                "role": "admin" if email.lower() == owner_email.lower() else "member",
+                            })
 
             for stub in projects_index:
                 project_gid = stub.get("gid")
@@ -122,10 +147,18 @@ def build(data_paths: Paths, team_owner_overrides: dict[str, str] | None = None,
                         continue
                     boards[project_gid] = board
                     board_uuid_by_project_gid[project_gid] = board["uuid"]
+                    board["created_by_reference_code"] = ref(board["created_by_email"])
+                    seen_board_members: set[str] = set()
                     for member in board.pop("_members", []):
                         email = member.get("email")
-                        if email:
-                            board_members.append({"board_uuid": board["uuid"], "member_email": email})
+                        if email and email.lower() not in seen_board_members:
+                            seen_board_members.add(email.lower())
+                            board_members.append({
+                                "board_uuid": board["uuid"],
+                                "member_email": email,
+                                "member_reference_code": ref(email),
+                                "role": "admin" if email.lower() == board["created_by_email"].lower() else "member",
+                            })
 
                 if team_uuid is not None:
                     board_uuid = board_uuid_by_project_gid.get(project_gid)
@@ -143,22 +176,42 @@ def _build_tags(data_paths: Paths, existing_tag_uuids: dict[str, str]) -> list[d
     same way teams/boards are. A `uuid` is minted per tag so
     `build_tasks.py`'s `task_tag` pivot has a stable business key to
     reference (DESIGN.md §10: "task and tag are each upserted and
-    re-queried by uuid before task_tag can be written")."""
-    tags: dict[str, dict] = {}
+    re-queried by uuid before task_tag can be written").
+
+    Asana allows many tags with the same name (this export: `critica` x11),
+    padmasana shows them as one - so tags are merged by trimmed, case-
+    insensitive name. The lowest gid is the canonical one (stable across
+    runs); the rest go in `alias_asana_gids` so build_tasks still resolves
+    them. Color: the canonical tag's, or the first real one in the group.
+    Colors stay Asana's names here - `format-docs` maps them to CSS."""
     if not data_paths.root.exists():
         return []
+    raw: dict[str, dict] = {}
     for workspace_dir in sorted(p for p in data_paths.root.iterdir() if p.is_dir()):
         for tag in read_json(workspace_dir / "tags.json", default=[]) or []:
             gid = tag.get("gid")
-            if not gid or gid in tags:
-                continue
-            tags[gid] = {
-                "asana_gid": gid,
-                "uuid": existing_tag_uuids.get(gid) or str(uuid.uuid4()),
-                "name": {"en": tag.get("name") or ""},
-                "color": tag.get("color") or "",
-            }
-    return list(tags.values())
+            if gid and gid not in raw:
+                raw[gid] = tag
+
+    groups: dict[str, list[dict]] = {}
+    for tag in raw.values():
+        groups.setdefault((tag.get("name") or "").strip().lower(), []).append(tag)
+
+    out = []
+    for group in groups.values():
+        group.sort(key=lambda t: int(t["gid"]) if t["gid"].isdigit() else 0)
+        canonical = group[0]
+        gids = [t["gid"] for t in group]
+        color = next((t.get("color") for t in group if t.get("color") and t.get("color") != "none"),
+                     canonical.get("color") or "")
+        out.append({
+            "asana_gid": canonical["gid"],
+            "alias_asana_gids": gids[1:],
+            "uuid": next((existing_tag_uuids[g] for g in gids if g in existing_tag_uuids), None) or str(uuid.uuid4()),
+            "name": {"en": (canonical.get("name") or "").strip()},
+            "color": color,
+        })
+    return out
 
 
 def _build_board(
@@ -185,6 +238,7 @@ def _build_board(
         return None
 
     board_uuid = existing_board_uuids.get(project_gid) or str(uuid.uuid4())
+    first_section_index = len(sections_out)
     log.info("Board '%s' (%s): created_by=%s (%s)", project_json.get("name"), project_gid, created_by_email, source)
 
     section_list = read_json(project_dir / "sections.json", default=[]) or []
@@ -198,6 +252,7 @@ def _build_board(
             "order": order,
         })
 
+    board_sections = sections_out[first_section_index:]
     return {
         "asana_gid": project_gid,
         "uuid": board_uuid,
@@ -205,6 +260,12 @@ def _build_board(
         "description": project_json.get("notes") or "",
         "privacy": "PRIVATE",
         "created_by_email": created_by_email,
+        # padmasana drops new tasks into the board's default section; Asana
+        # has none, so the first section (order 0) plays that role.
+        "default_section_uuid": board_sections[0]["uuid"] if board_sections else None,
+        "created_at": project_json.get("created_at"),
+        "updated_at": project_json.get("modified_at"),
+        "archived_at": project_json.get("modified_at") if project_json.get("archived") else None,
         "_members": members,  # popped by the caller before this dict is written out
     }
 
@@ -222,7 +283,7 @@ def _result(tags, teams, boards, sections, board_teams, board_members, team_memb
 
 
 def write_output(build_dir: Path, result: dict) -> None:
-    write_json(build_dir / "tags.json", result["tags"])
+    write_json(build_dir / ALL_TAGS_FILE, result["tags"])
     write_json(build_dir / "teams.json", result["teams"])
     write_json(build_dir / "boards.json", result["boards"])
     write_json(build_dir / "sections.json", result["sections"])

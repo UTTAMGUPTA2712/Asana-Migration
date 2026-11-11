@@ -39,7 +39,7 @@ from asana_migration.storage import Paths, read_json, write_json
 
 from . import activity
 from .asana_source import find_task_dir, iter_all_task_dirs
-from .people import email_of
+from .people import RefResolver, email_of
 
 log = logging.getLogger("padmasana_migration.build_tasks")
 
@@ -52,13 +52,30 @@ _ASANA_GID_ATTR_RE = re.compile(r'data-asana-gid="(\d+)"')
 _ASANA_TYPE_ATTACHMENT_RE = re.compile(r'data-asana-type="attachment"')
 _ASSET_ID_RE = re.compile(r"asset_id=(\d+)")
 
+# Namespace for task_activity_log uuids: uuid5(namespace, "<task_uuid>:<source_key>")
+# so rebuilding never reissues them (padmasana upserts on `uuid`).
+_ACTIVITY_UUID_NS = uuid.UUID("6f1c9a52-3d0e-4b8f-9a77-2c4e5d8b1a10")
+_BOARD_EVENT_TYPES = {"task_added_to_board", "task_removed_from_board", "task_moved_to_section"}
+# Asana tasks with an empty name keep it empty, and get this tag so they can
+# be found and named in padmasana. Synthetic (no Asana gid) - its uuid is
+# fixed so rebuilds don't reissue it; only seeded if some task uses it.
+UNTITLED_TAG = {
+    "asana_gid": None,
+    "alias_asana_gids": [],
+    "uuid": "3b1f0c2e-7a5d-5e4b-9c8f-0d6a1e2b3c4d",
+    "name": {"en": "Untitled"},
+    "color": "none",
+}
+
 
 @dataclass
 class ReferenceData:
     registry: dict[str, dict]
     board_by_project_gid: dict[str, dict]  # asana project gid -> {uuid, name}
     section_by_asana_gid: dict[str, dict]  # asana section gid -> {uuid, board_uuid, board_asana_gid, name}
-    tag_by_asana_gid: dict[str, dict]  # asana tag gid -> {uuid}
+    tag_by_asana_gid: dict[str, dict]  # asana tag gid (canonical or alias) -> {uuid}
+    boards_by_name: dict[str, list[dict]]  # trimmed lowercased board name -> boards with that name
+    resolver: RefResolver
 
 
 @dataclass
@@ -72,8 +89,23 @@ class BuildContext:
 def load_reference_data(build_dir: Path, registry: dict[str, dict]) -> ReferenceData:
     boards = {b["asana_gid"]: b for b in read_json(build_dir / "boards.json", default=[]) or []}
     sections = {s["asana_gid"]: s for s in read_json(build_dir / "sections.json", default=[]) or []}
-    tags = {t["asana_gid"]: t for t in read_json(build_dir / "tags.json", default=[]) or []}
-    return ReferenceData(registry=registry, board_by_project_gid=boards, section_by_asana_gid=sections, tag_by_asana_gid=tags)
+    from .build_teams_and_boards import ALL_TAGS_FILE
+    tag_rows = read_json(build_dir / ALL_TAGS_FILE, default=None)
+    if tag_rows is None:
+        tag_rows = read_json(build_dir / "tags.json", default=[]) or []
+    tags: dict[str, dict] = {}
+    for t in tag_rows:
+        for gid in [t["asana_gid"], *(t.get("alias_asana_gids") or [])]:
+            tags[gid] = t
+    boards_by_name: dict[str, list[dict]] = {}
+    for b in boards.values():
+        boards_by_name.setdefault((b.get("name") or "").strip().lower(), []).append(b)
+    resolver = RefResolver(build_dir)
+    if not resolver.system_ref:
+        log.warning("No system fallback user in build/placeholder_users.json - rows with an unknown Asana actor "
+                    "will get a null *_reference_code. Run `padmasana-create-placeholder-users` first.")
+    return ReferenceData(registry=registry, board_by_project_gid=boards, section_by_asana_gid=sections,
+                         tag_by_asana_gid=tags, boards_by_name=boards_by_name, resolver=resolver)
 
 
 def _task_out_dir(build_dir: Path, task_gid: str) -> Path:
@@ -102,27 +134,48 @@ def h_build_task_pass1(ctx: BuildContext, payload: dict) -> None:
     task_uuid = _stable_uuid(out_dir / "task.json")
 
     created_by_email = _resolve_created_by(task, stories, ctx.ref)
+    resolver = ctx.ref.resolver
+    created_by_ref = resolver.ref_or_system(created_by_email)
 
     comments = _build_comments(out_dir, task_uuid, comments_raw)
+    for c in comments:
+        c["author_reference_code"] = resolver.ref_or_system(c["author_email"])
     write_json(out_dir / "comments.json", comments)
 
     tags_out = _build_task_tags(task, task_uuid, ctx.ref)
+    if not (task.get("name") or "").strip():
+        tags_out.append({"task_uuid": task_uuid, "tag_uuid": UNTITLED_TAG["uuid"]})
     write_json(out_dir / "tags.json", tags_out)
 
     board_sections, section_tasks = _build_sections(task, task_uuid, ctx.ref)
     write_json(out_dir / "board_section.json", board_sections)
     write_json(out_dir / "section_task.json", section_tasks)
 
-    collaborators_out = [
-        {"task_uuid": task_uuid, "collaborator_email": email}
-        for c in collaborators_raw
-        if (email := email_of(c))
-    ]
+    collaborators_out = []
+    seen_collaborators: set[str] = set()
+    for c in collaborators_raw:
+        email = email_of(c)
+        if email and email.lower() not in seen_collaborators:
+            seen_collaborators.add(email.lower())
+            collaborators_out.append({"task_uuid": task_uuid, "collaborator_email": email,
+                                      "collaborator_reference_code": resolver.ref(email)})
     write_json(out_dir / "task_collaborators.json", collaborators_out)
 
     task_attachments, comment_attachments = _build_attachments(
         ctx, out_dir, task_gid, task_uuid, attachments_raw, comments, stories, created_by_email,
     )
+    # Link-only attachments (gdrive/external/vimeo - no file was ever
+    # uploaded) aren't padmasana attachments, just links. Most are already in
+    # the description or a comment; the rest are carried here so format-docs
+    # appends them to the description instead of losing them.
+    texts = [task.get("html_notes") or "", task.get("notes") or ""]
+    texts += [(c.get("html_text") or "") + (c.get("text") or "") for c in comments]
+    task_links = []
+    for att in [*task_attachments, *comment_attachments]:
+        if _is_link_only(att) and not _link_referenced(att["metadata"].get("url") or "", texts):
+            task_links.append({"name": att.get("name") or att["metadata"].get("url"), "url": att["metadata"]["url"]})
+    task_attachments = [a for a in task_attachments if not _is_link_only(a)]
+    comment_attachments = [a for a in comment_attachments if not _is_link_only(a)]
     write_json(out_dir / "attachments.json", task_attachments)
     write_json(out_dir / "comment_attachments.json", comment_attachments)
 
@@ -130,25 +183,34 @@ def h_build_task_pass1(ctx: BuildContext, payload: dict) -> None:
         task=task, stories=stories, comments=comments,
         task_created_by_email=created_by_email, registry=ctx.ref.registry,
     )
+    task_board_gids = _task_board_gids(task)
     for row in activity_log:
+        row["uuid"] = _activity_uuid(task_uuid, row.pop("source_key"))
         row["task_uuid"] = task_uuid  # compiled task_activity_log.json is flat - rows must say which task
+        row["actor_reference_code"] = resolver.ref_or_system(row["actor_email"])
+        if row["event_type"] in _BOARD_EVENT_TYPES:
+            row["data"]["board_uuid"] = _resolve_board_uuid(row["data"].get("board_name"), task_board_gids, ctx.ref)
     write_json(out_dir / "activity_log.json", activity_log)
 
     assignee_email = email_of(task.get("assignee"))
     task_out = {
         "asana_gid": task_gid,
         "uuid": task_uuid,
-        "name": task.get("name"),
+        "name": task.get("name") or "",
         "description": task.get("notes") or "",
         "description_html": task.get("html_notes") or "",
         "assignee_email": assignee_email,
+        "assignee_reference_code": resolver.ref(assignee_email),
         "created_at": task.get("created_at"),
+        "updated_at": task.get("modified_at"),
         "due_date": task.get("due_on") or ((task.get("due_at") or "")[:10] or None),
         "completed_at": task.get("completed_at"),
         "assigned_at": _resolve_assigned_at(task, stories, assignee_email),
         "created_by_email": created_by_email,
+        "created_by_reference_code": created_by_ref,
         "parent_asana_gid": (task.get("parent") or {}).get("gid"),
         "parent_task_uuid": None,  # patched by pass 2
+        "links": task_links,  # appended to the description by format-docs
     }
     write_json(out_dir / "task.json", task_out)
     log.info("Task '%s' (%s): built (%d comment(s), %d activity row(s))",
@@ -169,6 +231,44 @@ def _stable_uuid(existing_task_json_path: Path) -> str:
     if existing and existing.get("uuid"):
         return existing["uuid"]
     return str(uuid.uuid4())
+
+
+_DRIVE_ID_RE = re.compile(r"/d/([\w-]+)|[?&]id=([\w-]+)")
+
+
+def _is_link_only(att: dict) -> bool:
+    meta = att.get("metadata") or {}
+    return not meta.get("path") and bool(meta.get("url"))
+
+
+def _link_referenced(url: str, texts: list[str]) -> bool:
+    """The url, or (Google Drive) just its file id, since the same file shows
+    up under several url shapes (/file/d/<id>/view, open?id=<id>, ...)."""
+    keys = [url] + [g for m in _DRIVE_ID_RE.finditer(url) for g in m.groups() if g]
+    return any(k and k in t for k in keys for t in texts)
+
+
+def _activity_uuid(task_uuid: str, source_key: str) -> str:
+    return str(uuid.uuid5(_ACTIVITY_UUID_NS, f"{task_uuid}:{source_key}"))
+
+
+def _task_board_gids(task: dict) -> list[str]:
+    gids = [p.get("gid") for p in task.get("projects", []) or []]
+    gids += [(m.get("project") or {}).get("gid") for m in task.get("memberships", []) or []]
+    return [g for g in dict.fromkeys(gids) if g]
+
+
+def _resolve_board_uuid(board_name: str | None, task_board_gids: list[str], ref: ReferenceData) -> str | None:
+    """Asana's story text only names the board. Board names aren't unique, so
+    prefer a same-named board the task belongs to; otherwise accept a name
+    that matches exactly one board (e.g. the board it was later removed from).
+    Ambiguous or unknown -> None (the key is still written, padmasana's
+    ACTIVITY_DATA_MAPPER only checks it's present)."""
+    candidates = ref.boards_by_name.get((board_name or "").strip().lower(), [])
+    own = [b for b in candidates if b["asana_gid"] in task_board_gids]
+    if own:
+        return own[0]["uuid"]
+    return candidates[0]["uuid"] if len(candidates) == 1 else None
 
 
 def _resolve_created_by(task: dict, stories: list[dict], ref: ReferenceData) -> str | None:
@@ -216,9 +316,11 @@ def _build_task_tags(task: dict, task_uuid: str, ref: ReferenceData) -> list[dic
     for tag in task.get("tags", []) or []:
         entry = ref.tag_by_asana_gid.get(tag.get("gid"))
         if entry is None:
-            log.warning("Task %s: tag %s ('%s') not found in build/tags.json - skipping", task.get("gid"), tag.get("gid"), tag.get("name"))
+            log.warning("Task %s: tag %s ('%s') not found in build/all_tags.json - skipping", task.get("gid"), tag.get("gid"), tag.get("name"))
             continue
-        out.append({"task_uuid": task_uuid, "tag_uuid": entry["uuid"]})
+        row = {"task_uuid": task_uuid, "tag_uuid": entry["uuid"]}
+        if row not in out:  # two same-named Asana tags merge into one padmasana tag
+            out.append(row)
     return out
 
 
@@ -298,6 +400,7 @@ def _build_attachments(
         att_uuid = meta.get("uuid") or uploaded.get("uuid") or str(uuid.uuid4())
 
         comment = embedded_in.get(gid)
+        resolver = ctx.ref.resolver
         if comment is not None:
             comment_level.append({
                 "uuid": att_uuid,
@@ -306,6 +409,8 @@ def _build_attachments(
                 "name": att.get("name"),
                 "metadata": meta,
                 "uploaded_by_email": uploaded_by_email,
+                "uploaded_by_reference_code": resolver.ref_or_system(
+                    uploaded_by_email, comment.get("author_email"), created_by_email),
                 "created_at": created_at,
             })
         else:
@@ -316,6 +421,7 @@ def _build_attachments(
                 "name": att.get("name"),
                 "metadata": meta,
                 "uploaded_by_email": uploaded_by_email,
+                "uploaded_by_reference_code": resolver.ref_or_system(uploaded_by_email, created_by_email),
                 "created_at": created_at,
             })
     return task_level, comment_level
@@ -384,8 +490,15 @@ def run_pass2(build_dir: Path) -> tuple[int, int]:
             continue
         parent_uuid = uuid_by_asana_gid.get(parent_gid)
         if parent_uuid is None:
-            log.warning("Task %s: parent %s not found among built tasks - leaving parent_task_uuid null",
+            # Parent never exported (deleted, or in a project we can't see):
+            # the subtask becomes a top-level task of its own. The Asana
+            # parent gid is kept only for traceability.
+            log.warning("Task %s: parent %s not found among built tasks - making it a top-level task",
                         task.get("asana_gid"), parent_gid)
+            task["parent_asana_gid"] = None
+            task["parent_task_uuid"] = None
+            task["missing_asana_parent_gid"] = parent_gid
+            write_json(task_json_path, task)
             missing += 1
             continue
         if task.get("parent_task_uuid") != parent_uuid:
@@ -402,6 +515,12 @@ def compile_build(build_dir: Path) -> dict[str, int]:
     section_tasks_raw: list[dict] = []
     task_collaborators, task_attachments, comment_attachments, activity_rows = [], [], [], []
     created_at_by_task_uuid: dict[str, str] = {}
+
+    # task-management's board_section is its own copy of every board-
+    # management section, not only the ones holding tasks - an empty
+    # section still needs one so tasks can be added to it later.
+    for sec in read_json(build_dir / "sections.json", default=[]) or []:
+        board_sections_by_uuid[sec["uuid"]] = {"uuid": sec["uuid"], "board_uuid": sec["board_uuid"], "section_uuid": sec["uuid"]}
 
     if tasks_dir.exists():
         for task_dir in sorted(tasks_dir.iterdir()):
@@ -446,11 +565,23 @@ def compile_build(build_dir: Path) -> dict[str, int]:
     write_json(build_dir / "comments.json", comments)
     write_json(build_dir / "task_activity_log.json", activity_rows)
 
+    # Only tags some task uses get seeded (2.7k of Asana's 2.8k never were).
+    from .build_teams_and_boards import ALL_TAGS_FILE
+    used_tag_uuids = {r["tag_uuid"] for r in task_tags}
+    all_tags = read_json(build_dir / ALL_TAGS_FILE, default=None)
+    if all_tags is not None:
+        all_tags = [*all_tags, UNTITLED_TAG]
+        tags_out = [t for t in all_tags if t["uuid"] in used_tag_uuids]
+        write_json(build_dir / "tags.json", tags_out)
+    else:
+        log.warning("%s/%s missing - leaving tags.json as is (re-run build-teams-and-boards).", build_dir, ALL_TAGS_FILE)
+        tags_out = read_json(build_dir / "tags.json", default=[]) or []
+
     return {
         "tasks": len(tasks), "task_tags": len(task_tags), "board_sections": len(board_sections_by_uuid),
         "section_tasks": len(section_tasks), "task_collaborators": len(task_collaborators),
         "attachments": len(task_attachments), "comment_attachments": len(comment_attachments),
-        "comments": len(comments), "activity_log": len(activity_rows),
+        "comments": len(comments), "activity_log": len(activity_rows), "tags": len(tags_out),
     }
 
 

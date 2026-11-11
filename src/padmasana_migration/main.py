@@ -139,7 +139,7 @@ def _cmd_format_docs(args: argparse.Namespace) -> None:
     _configure_logging(args.verbose)
 
     from . import config
-    from .format_docs import format_all_tasks, load_format_context
+    from .format_docs import format_all_tasks, format_build_records, load_format_context
     from .import_users import report_missing_users
     from asana_migration.storage import Paths
 
@@ -159,6 +159,11 @@ def _cmd_format_docs(args: argparse.Namespace) -> None:
     elapsed = time.monotonic() - start
 
     log.info("=== Done in %.1fs: %d task(s) and %d comment(s) formatted ===", elapsed, tasks_count, comments_count)
+
+    if not args.task_gid:
+        log.info("Formatting records (LexoRank order, tag colors, privacy enum)...")
+        counts = format_build_records(config.BUILD_DIR, dry_run=args.dry_run)
+        log.info("=== Records: %s ===", ", ".join(f"{k}={v}" for k, v in counts.items()))
     report_missing_users(config.BUILD_DIR)
 
 
@@ -304,7 +309,7 @@ def _cmd_build_tasks(args: argparse.Namespace) -> None:
         log.info("=== Done: %s ===", ", ".join(f"{k}={v}" for k, v in counts.items()))
         return
 
-    for required in ("boards.json", "sections.json", "tags.json"):
+    for required in ("boards.json", "sections.json", "all_tags.json"):
         if not (config.BUILD_DIR / required).exists():
             log.error("%s/%s missing - run `padmasana-build-teams-and-boards` first.", config.BUILD_DIR, required)
             raise SystemExit(1)
@@ -365,7 +370,7 @@ def _cmd_build_tasks(args: argparse.Namespace) -> None:
 
     log.info("=== Pass 2/2: patching parent_task_uuid ===")
     patched, missing = run_pass2(config.BUILD_DIR)
-    log.info("Patched %d task(s), %d with an unresolvable parent (left null).", patched, missing)
+    log.info("Patched %d task(s), %d with an unexported parent (made top-level).", patched, missing)
 
     if not args.no_compile:
         log.info("=== Compiling into the flat build/ files ===")

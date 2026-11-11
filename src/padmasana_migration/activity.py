@@ -79,6 +79,7 @@ def build_activity_log(
         "actor_email": task_created_by_email,
         "created_at": task.get("created_at"),
         "data": {},
+        "source_key": "task_created",
     })
 
     sorted_stories = sorted(stories, key=lambda s: s.get("created_at") or "")
@@ -87,6 +88,7 @@ def build_activity_log(
     running_name = None  # chain of task_renamed old_value <- previous new_value
 
     for i, story in enumerate(sorted_stories):
+        events_before = len(events)
         subtype = story.get("resource_subtype")
         text = story.get("text") or ""
         actor = _actor_email(story)
@@ -172,12 +174,18 @@ def build_activity_log(
         # else: no padmasana event type for this story subtype - left out
         # (DESIGN.md §5.8's final paragraph).
 
+        # The story gid is what makes each row's uuid stable across rebuilds
+        # (see build_tasks._activity_uuid).
+        for event in events[events_before:]:
+            event["source_key"] = f"story:{story.get('gid') or i}"
+
     for comment in comments:
         events.append({
             "event_type": "task_comment_added",
             "actor_email": comment.get("author_email"),
             "created_at": comment.get("created_at"),
             "data": {"comment_uuid": comment["uuid"]},
+            "source_key": f"comment:{comment['uuid']}",
         })
 
     events.sort(key=lambda e: e.get("created_at") or "")
