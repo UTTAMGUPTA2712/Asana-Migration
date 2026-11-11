@@ -106,6 +106,35 @@ def _cmd_import_users(args: argparse.Namespace) -> None:
         report_missing_users(config.BUILD_DIR, all_users)
 
 
+def _cmd_create_placeholder_users(args: argparse.Namespace) -> None:
+    _configure_logging(args.verbose)
+
+    from collections import Counter
+
+    from . import config
+    from .placeholder_users import create_placeholder_users
+
+    created = create_placeholder_users(config.BUILD_DIR)
+    kinds = Counter(c["placeholder_kind"] for c in created)
+    log.info(
+        "=== Done: %d placeholder user(s) in %s/placeholder_users.json (%s) - merged into "
+        "padmasana_users.json and user_to_asana_gid.json ===",
+        len(created), config.BUILD_DIR, ", ".join(f"{k}: {v}" for k, v in sorted(kinds.items())),
+    )
+
+
+def _require_urls(args: argparse.Namespace, pad_cfg: dict) -> tuple[str, str]:
+    """The app and file-service URLs end up inside the formatted output that gets seeded
+    into padmasana, so there is deliberately no localhost fallback - missing means stop."""
+    app_url = args.app_url or pad_cfg.get("app_url") or os.environ.get("PADMASANA_APP_URL")
+    file_service_url = args.file_service_url or pad_cfg.get("file_service_url") or os.environ.get("FILE_SERVICE_URL")
+    missing = [n for n, v in (("--app-url (or env PADMASANA_APP_URL / config app_url)", app_url),
+                              ("--file-service-url (or env FILE_SERVICE_URL / config file_service_url)", file_service_url)) if not v]
+    if missing:
+        raise SystemExit("Required: " + " and ".join(missing) + ". These URLs are written into the output, so no default is used.")
+    return app_url.rstrip("/"), file_service_url.rstrip("/")
+
+
 def _cmd_format_docs(args: argparse.Namespace) -> None:
     _configure_logging(args.verbose)
 
@@ -115,8 +144,7 @@ def _cmd_format_docs(args: argparse.Namespace) -> None:
     from asana_migration.storage import Paths
 
     pad_cfg = config.get_padmasana_config()
-    app_url = args.app_url or pad_cfg.get("app_url") or os.environ.get("PADMASANA_APP_URL") or "http://localhost:3000"
-    file_service_url = args.file_service_url or pad_cfg.get("file_service_url") or os.environ.get("FILE_SERVICE_URL") or "http://localhost:8080"
+    app_url, file_service_url = _require_urls(args, pad_cfg)
 
     if not args.no_save_config and not args.dry_run:
         config.save_padmasana_config(app_url=app_url, file_service_url=file_service_url)
@@ -156,8 +184,7 @@ def _cmd_inspect_task(args: argparse.Namespace) -> None:
         return
 
     pad_cfg = config.get_padmasana_config()
-    app_url = args.app_url or pad_cfg.get("app_url") or os.environ.get("PADMASANA_APP_URL") or "http://localhost:3000"
-    file_service_url = args.file_service_url or pad_cfg.get("file_service_url") or os.environ.get("FILE_SERVICE_URL") or "http://localhost:8080"
+    app_url, file_service_url = _require_urls(args, pad_cfg)
 
     data_paths = Paths(root=config.DATA_DIR)
     ctx = load_format_context(config.BUILD_DIR, app_url=app_url, file_service_url=file_service_url, data_paths=data_paths)
@@ -282,13 +309,29 @@ def _cmd_build_tasks(args: argparse.Namespace) -> None:
             log.error("%s/%s missing - run `padmasana-build-teams-and-boards` first.", config.BUILD_DIR, required)
             raise SystemExit(1)
 
+    # Guard the order of operations: build-tasks reads emails from the user map, so an
+    # unmapped Asana user silently drops out of tasks/comments/collaborators. Fail early
+    # instead (import-users -> create-placeholder-users -> map-users first).
+    from asana_migration.storage import read_json as _read_json
+    user_map = _read_json(config.BUILD_DIR / "user_to_asana_gid.json", default=None)
+    if user_map is None:
+        log.error("%s/user_to_asana_gid.json missing - run `padmasana-map-users` (after import-users and "
+                  "create-placeholder-users) first.", config.BUILD_DIR)
+        raise SystemExit(1)
+    unmapped = [g for g, u in user_map.items() if not u.get("user_reference_code")]
+    if unmapped and not args.allow_unmapped_users:
+        log.error("%d Asana user(s) in user_to_asana_gid.json have no user_reference_code (e.g. gid %s). Run "
+                  "`padmasana-import-users` then `padmasana-create-placeholder-users` and `padmasana-map-users`, "
+                  "or pass --allow-unmapped-users to build anyway.", len(unmapped), unmapped[0])
+        raise SystemExit(1)
+
     log.info("Scanning workspace export to build the person registry (for assignee/prev_assignee resolution)...")
     registry = build_person_registry(data_paths)
     ref = load_reference_data(config.BUILD_DIR, registry)
     ctx = BuildContext(data_paths=data_paths, build_dir=config.BUILD_DIR, queue=queue, ref=ref)
 
     log.info("=== Pass 1/2: building every task (%d worker(s)) ===", args.concurrency)
-    queued = queue_pass1_jobs(data_paths, queue)
+    queued = queue_pass1_jobs(data_paths, queue, rebuild=args.rebuild)
     is_pass1_job = lambda j: j.type == "build_task_pass1"  # noqa: E731
     outstanding_stats = queue.stats_for(is_pass1_job)
     outstanding = outstanding_stats["queued"] + outstanding_stats["running"]
@@ -362,6 +405,14 @@ def build_parser() -> argparse.ArgumentParser:
     import_users.add_argument("-v", "--verbose", action="store_true")
     import_users.set_defaults(func=_cmd_import_users)
 
+    placeholders = sub.add_parser(
+        "create-placeholder-users",
+        help="Fabricate padmasana user records (Private User N / Deleted User N / name-from-email) for "
+             "Asana users missing from the Firebase service, and map them in build/user_to_asana_gid.json.",
+    )
+    placeholders.add_argument("-v", "--verbose", action="store_true")
+    placeholders.set_defaults(func=_cmd_create_placeholder_users)
+
     build_teams_and_boards = sub.add_parser(
         "build-teams-and-boards",
         help="Script 2: build teams.json/boards.json/sections.json/tags.json and their pivots from data/.",
@@ -394,6 +445,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Script 3: build every task (comments, activity log, attachments split, tags, sections) from data/.",
     )
     build_tasks.add_argument("--concurrency", type=int, default=8, metavar="N")
+    build_tasks.add_argument("--rebuild", action="store_true",
+                              help="Re-queue tasks already built (e.g. after the user map changed). Task uuids stay stable.")
+    build_tasks.add_argument("--allow-unmapped-users", action="store_true",
+                              help="Build even if some Asana users have no user_reference_code (they'll be dropped from rows).")
     build_tasks.add_argument("--no-compile", action="store_true", help="Skip the final compile step.")
     build_tasks.add_argument("--compile", dest="compile_only", action="store_true",
                               help="Only run the compile step (re-concatenate build/tasks/*/ without rebuilding).")
@@ -404,8 +459,8 @@ def build_parser() -> argparse.ArgumentParser:
         "format-docs",
         help="Transform HTML content in task descriptions and comments into Padmasana/Tiptap format (mentions, attachments, task/board links).",
     )
-    format_docs.add_argument("--app-url", help="Padmasana App base URL (env: PADMASANA_APP_URL or config, default: http://localhost:3000).")
-    format_docs.add_argument("--file-service-url", help="File service base URL (env: FILE_SERVICE_URL or config, default: http://localhost:8080).")
+    format_docs.add_argument("--app-url", help="Padmasana App base URL (required; env: PADMASANA_APP_URL or config).")
+    format_docs.add_argument("--file-service-url", help="File service base URL (required; env: FILE_SERVICE_URL or config).")
     format_docs.add_argument("--task-gid", help="Format only this specific task.")
     format_docs.add_argument("--dry-run", action="store_true", help="Preview transformations without writing to disk.")
     format_docs.add_argument("--no-save-config", action="store_true", help="Do not save URL arguments into var/config.json.")
@@ -438,6 +493,10 @@ def main(argv: list[str] | None = None) -> None:
 
 def map_users_main() -> None:
     main(["map-users", *sys.argv[1:]])
+
+
+def create_placeholder_users_main() -> None:
+    main(["create-placeholder-users", *sys.argv[1:]])
 
 
 def import_users_main() -> None:

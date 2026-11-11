@@ -50,7 +50,8 @@ def fetch_workspace_users(
     already flat)."""
     url = f"{base_url.rstrip('/')}/workspace-users/import"
     resp = requests.post(
-        url, json={"workspace": workspace, "organization_unit": organization_unit}, timeout=timeout,
+        url, json={"workspace": workspace, "organization_unit": organization_unit},
+        headers={"Accept": "application/json"}, timeout=timeout,
     )
     if resp.status_code not in (200, 201):
         raise ImportUsersError(f"POST {url} -> {resp.status_code}: {resp.text[:500]}")

@@ -17,8 +17,10 @@ Converts:
 
 from __future__ import annotations
 
+import html as html_lib
 import logging
 import re
+from html.parser import HTMLParser
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -167,6 +169,7 @@ def load_format_context(
                 "name": name,
                 "uuid": file_uuid,
                 "download_url": download_url,
+                "uploaded_at": att.get("created_at") or meta.get("created_at"),
             }
 
     return FormatContext(
@@ -181,13 +184,17 @@ def load_format_context(
     )
 
 
+def _uploaded_at_attr(att: dict) -> str:
+    return f' data-uploaded-at="{att["uploaded_at"]}"' if att.get("uploaded_at") else ""
+
+
 def format_mention(user_gid: str | None, raw_label: str, ctx: FormatContext, user: dict | None = None) -> str:
     if user is None:
         user = ctx.user_map.get(user_gid) or {}
     clean_label = raw_label.lstrip("@").strip()
 
     user_id = user.get("user_reference_code") or user.get("asana_gid") or user_gid or ""
-    label = user.get("padmasana_name") or user.get("name") or clean_label
+    label = " ".join((user.get("padmasana_name") or user.get("name") or clean_label).split())
     profile_url = user.get("profile_url") or ""
     email = user.get("email") or ""
 
@@ -198,10 +205,10 @@ def format_mention(user_gid: str | None, raw_label: str, ctx: FormatContext, use
         avatar_html = f'<span class="mention-avatar-text">{first_letter}</span>'
 
     return (
-        f'<span class="mention" data-type="mention" data-id="{user_id}" '
+        f'<span class="mention" contenteditable="false" data-type="mention" data-id="{user_id}" '
         f'data-label="{label}" data-profile-url="{profile_url}" data-email="{email}">'
         f'<span class="mention-avatar">{avatar_html}</span>'
-        f'<span style="display: none">&nbsp;</span>'
+        f'<span style="display: none;">&nbsp;</span>'
         f'<span class="mention-label">{label}</span>'
         f'</span>'
     )
@@ -289,8 +296,8 @@ def format_html_content(raw_html: str, ctx: FormatContext) -> str:
         if w_match and h_match:
             w, h = w_match.group(1), h_match.group(1)
             style = f"aspect-ratio: {w} / {h}; max-width: 100%; width: {w}px; height: auto;"
-            return f'<img src="{att["download_url"]}" alt="{name}" width="{w}" height="{h}" style="{style}" />'
-        return f'<img src="{att["download_url"]}" alt="{name}" style="display:block;max-width:100%;margin-left:auto;margin-right:auto" />'
+            return f'<img src="{att["download_url"]}" alt="{name}"{_uploaded_at_attr(att)} width="{w}" height="{h}" style="{style}">'
+        return f'<img src="{att["download_url"]}" alt="{name}"{_uploaded_at_attr(att)} style="display:block;max-width:100%;margin-left:auto;margin-right:auto">'
 
     content = IMG_ATTACHMENT_RE.sub(_sub_img_att, content)
 
@@ -301,7 +308,7 @@ def format_html_content(raw_html: str, ctx: FormatContext) -> str:
         att = ctx.attachment_by_asana_gid.get(att_gid)
         if att and att.get("download_url"):
             name = att.get("name") or "attachment"
-            return f'<a href="{att["download_url"]}" target="_blank" rel="noopener noreferrer">{name}</a>'
+            return f'<a href="{att["download_url"]}">{name}</a>'
         return inner
 
     content = OBJECT_ATTACHMENT_RE.sub(_sub_object_att, content)
@@ -352,12 +359,324 @@ def format_html_content(raw_html: str, ctx: FormatContext) -> str:
     # 4. Clean up any remaining raw data-asana attributes on standard tags
     content = re.sub(r'\s+data-asana-[a-z0-9_-]+="[^"]*"', '', content)
 
-    # 5. Format newlines into <br /> if content is not wrapped in block elements
-    lines = content.splitlines()
-    if lines and not any(tag in content.lower() for tag in ("<p>", "<div>", "<ul>", "<ol>", "<h1>", "<h2>", "<h3>", "<blockquote>")):
-        content = "<p>" + "<br />".join(line for line in lines if line.strip()) + "</p>"
+    # 5. Shape the markup the way the editor stores it (see `_normalize_blocks`).
+    return _normalize_blocks(content.strip())
 
-    return content.strip()
+
+# --- storage-format normalization ------------------------------------------
+#
+# The editor (Tiptap) normalizes whatever it loads when it renders, and the
+# backend stores *its* serialization - so what we seed has to already look
+# like that, or the DB holds one shape for migrated tasks and another for
+# anything edited in the app. Shapes taken from the live app's API:
+#   - every loose run of text is its own <p>...</p> (blank line -> <p></p>)
+#   - list items / blockquotes hold block children: <li><p>text</p></li>
+#   - images are top-level blocks, never inside a <p>
+#   - links: <a target="_blank" rel="noopener noreferrer nofollow" href="...">
+#   - <b> -> <strong>, <pre> -> <pre><code>..</code></pre>, void tags unclosed
+
+_VOID_TAGS = {"br", "hr", "img", "input", "meta", "link"}
+_BLOCK_TAGS = {"p", "ul", "ol", "li", "blockquote", "pre", "h1", "h2", "h3", "h4", "h5", "h6",
+               "table", "thead", "tbody", "tr", "td", "th", "hr", "div"}
+_WRAPPING_CONTAINERS = {"li", "blockquote", "td", "th"}  # hold block children, so loose inline content gets <p>
+_LINK_ATTRS = 'target="_blank" rel="noopener noreferrer nofollow"'
+
+
+class _Node:
+    __slots__ = ("tag", "attrs", "children")
+
+    def __init__(self, tag: str | None, attrs: list[tuple[str, str | None]] | None = None) -> None:
+        self.tag = tag  # None = synthetic root
+        self.attrs = attrs or []
+        self.children: list = []  # _Node | str (raw text/entity)
+
+
+class _TreeBuilder(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.root = _Node(None)
+        self.stack = [self.root]
+
+    def handle_starttag(self, tag, attrs):
+        node = _Node(tag, attrs)
+        self.stack[-1].children.append(node)
+        if tag not in _VOID_TAGS:
+            self.stack.append(node)
+
+    def handle_startendtag(self, tag, attrs):
+        self.stack[-1].children.append(_Node(tag, attrs))
+
+    def handle_endtag(self, tag):
+        for i in range(len(self.stack) - 1, 0, -1):
+            if self.stack[i].tag == tag:
+                del self.stack[i:]
+                return
+
+    def handle_data(self, data):
+        self.stack[-1].children.append(data)
+
+    def handle_entityref(self, name):
+        self.stack[-1].children.append(f"&{name};")
+
+    def handle_charref(self, name):
+        self.stack[-1].children.append(f"&#{name};")
+
+
+def _open_tag(node: _Node) -> str:
+    tag, attrs = node.tag, list(node.attrs)
+    if tag == "b":
+        tag = "strong"
+    if tag == "a" and any(k == "href" for k, _ in attrs) and not any(k == "data-type" for k, _ in attrs):
+        rest = [(k, v) for k, v in attrs if k not in ("target", "rel")]
+        return f"<a {_LINK_ATTRS}" + "".join(f' {k}="{_esc(v)}"' for k, v in rest) + ">"
+    return f"<{tag}" + "".join(f' {k}="{_esc(v)}"' if v is not None else f" {k}" for k, v in attrs) + ">"
+
+
+def _esc(v: str | None) -> str:
+    """Attribute value the way the browser serializes it (what the editor stores)."""
+    return (v or "").replace("&", "&amp;").replace('"', "&quot;").replace("\u00a0", "&nbsp;")
+
+
+def _esc_text(text: str, pre: bool = False) -> str:
+    """Text node the way the browser serializes it: only & < > (and nbsp) are escaped -
+    a literal quote stays a quote, so `&quot;`/`&#39;` from Asana are decoded first."""
+    text = html_lib.unescape(text)
+    if not pre:
+        text = re.sub(r"[ \t\r\n\f\v]+", " ", text)  # HTML whitespace collapsing, as the editor's parser does
+    return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace("\u00a0", "&nbsp;"))
+
+
+_DROPPED_INLINE_TAGS = {"mark"}  # no extension in the editor's schema - it keeps the text only
+_LINK_INNER_MARKS = {"strong", "b", "em", "u", "s"}
+
+
+def _render_inline(node, pre: bool = False) -> str:
+    if isinstance(node, str):
+        return _esc_text(node, pre)
+    if node.tag in _VOID_TAGS:
+        return _open_tag(node)
+    if node.tag in _DROPPED_INLINE_TAGS:
+        return "".join(_render_inline(c) for c in node.children)
+    if node.tag in _LINK_INNER_MARKS:
+        # The editor always nests marks link-outermost: <a><strong>..</strong></a>.
+        kids = [c for c in node.children if not (isinstance(c, str) and not c.strip())]
+        if len(kids) == 1 and isinstance(kids[0], _Node) and kids[0].tag == "a":
+            link = kids[0]
+            inner = _Node(node.tag, node.attrs)
+            inner.children = link.children
+            outer = _Node("a", link.attrs)
+            outer.children = [inner]
+            return _render_inline(outer)
+    tag = "strong" if node.tag == "b" else node.tag
+    return _open_tag(node) + "".join(_render_inline(c, pre) for c in node.children) + f"</{tag}>"
+
+
+def _render_block(node: _Node) -> str:
+    tag = "strong" if node.tag == "b" else node.tag
+    if node.tag in _VOID_TAGS:
+        return _open_tag(node)
+    if node.tag == "pre":
+        inner = "".join(_render_inline(c, pre=True) for c in node.children)
+        if "<code" not in inner:
+            inner = f"<code>{inner}</code>"
+        return _open_tag(node) + inner + "</pre>"
+    if node.tag in ("table", "thead", "tbody", "tr"):
+        # no table extension in the editor's schema: cells flatten into plain paragraphs
+        return "".join(_render_block(c) if isinstance(c, _Node) else "" for c in node.children)
+    if node.tag in ("td", "th"):
+        return _render_children(node.children, wrap=True)
+    if node.tag in ("ul", "ol"):
+        items: list[str] = []
+        for c in node.children:
+            if not isinstance(c, _Node):
+                continue
+            rendered = _render_block(c)
+            if c.tag in ("ul", "ol"):  # list directly inside a list -> child of the previous item
+                if items:
+                    items[-1] = items[-1][: -len("</li>")] + rendered + "</li>"
+                else:
+                    items.append(f"<li><p></p>{rendered}</li>")
+            else:
+                items.append(rendered)
+        return _open_tag(node) + "".join(items) + f"</{tag}>"
+    if node.tag in _WRAPPING_CONTAINERS:
+        inner = _render_children(node.children, wrap=True)
+        if not inner and node.tag in _WRAPPING_CONTAINERS:
+            inner = "<p></p>"  # an empty bullet is still a paragraph in the editor's schema
+        return _open_tag(node) + inner + f"</{tag}>"
+    return _open_tag(node) + _trim_edges(_canon_marks("".join(_render_inline(c) for c in node.children))) + f"</{tag}>"
+
+
+def _is_block(c) -> bool:
+    return isinstance(c, _Node) and c.tag in _BLOCK_TAGS
+
+
+# --- mark canonicalization -------------------------------------------------
+# The editor serializes inline marks in its schema order (outermost first) and re-opens
+# them per text run, whatever order the source nested them in: <s>a<strong>b</strong>c</s>
+# becomes <s>a</s><strong><s>b</s></strong><s>c</s>. `code` excludes every other mark.
+
+_MARK_RANK = {"a": 0, "strong": 2, "code": 3, "em": 4, "s": 5, "u": 6}
+_TOKEN_RE = re.compile(r"(<[^>]+>)")
+
+
+_OPEN_MARKS = r"(?:<(?:a|strong|em|u|s|code)\b[^>]*>)*"
+_CLOSE_MARKS = r"(?:</(?:a|strong|em|u|s|code)>)*"
+
+
+def _trim_edges(html: str) -> str:
+    """The editor trims whitespace at a block's edges even when it sits inside a mark,
+    and drops marks left empty by that."""
+    html = re.sub(rf"^({_OPEN_MARKS})\s+", r"\1", html)
+    html = re.sub(rf"\s+({_CLOSE_MARKS})$", r"\1", html)
+    prev = None
+    while prev != html:
+        prev = html
+        html = re.sub(r"<(strong|em|u|s|code)>\s*</\1>", "", html)
+        html = re.sub(r'<a [^>]*>\s*</a>', "", html)
+    return html
+
+
+def _canon_marks(inline_html: str) -> str:
+    if not re.search(r"<(?:strong|em|u|s|code)\b", inline_html) :
+        return inline_html
+    items: list[tuple[str, list[tuple[str, str]], bool]] = []  # (html, marks[(tag, open_tag_html)], is_text)
+    stack: list[tuple[str, str]] = []
+    tokens = [t for t in _TOKEN_RE.split(inline_html) if t != ""]
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        m = re.match(r"<(/?)([a-zA-Z0-9]+)\b", t) if t.startswith("<") else None
+        if m is None:
+            items.append((t, list(stack), True))
+        else:
+            closing, name = m.group(1) == "/", m.group(2).lower()
+            is_mark = name in _MARK_RANK and not (name == "a" and "data-type" in t)
+            if is_mark and not closing:
+                stack.append((name, t))
+            elif is_mark and closing:
+                for j in range(len(stack) - 1, -1, -1):
+                    if stack[j][0] == name:
+                        del stack[j]
+                        break
+            elif name == "span" and not closing and 'class="mention"' in t:
+                depth, j = 0, i
+                while j < len(tokens):  # whole mention subtree is one atom
+                    tj = tokens[j]
+                    if re.match(r"<span\b", tj):
+                        depth += 1
+                    elif tj == "</span>":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    j += 1
+                items.append(("".join(tokens[i:j + 1]), [], False))
+                i = j
+            else:
+                items.append((t, [], False))  # br, img, other tags: atoms with no marks
+        i += 1
+
+    out: list[str] = []
+    active: list[tuple[str, str]] = []
+    ends_with_space = False
+    for html_piece, marks, is_text in items:
+        if is_text:
+            # whitespace collapses across run boundaries too: "a </strong> <em>b" has one space
+            if ends_with_space and html_piece.startswith(" "):
+                html_piece = html_piece[1:]
+            if not html_piece:
+                continue
+            ends_with_space = html_piece.endswith(" ")
+        else:
+            ends_with_space = False
+        seen, uniq = set(), []
+        for mk in marks:
+            if mk[0] not in seen:
+                seen.add(mk[0])
+                uniq.append(mk)
+        if any(n == "code" for n, _ in uniq):
+            uniq = [mk for mk in uniq if mk[0] == "code"]
+        uniq.sort(key=lambda mk: _MARK_RANK[mk[0]])
+        keep = 0
+        while keep < min(len(active), len(uniq)) and active[keep] == uniq[keep]:
+            keep += 1
+        while len(active) > keep:
+            out.append(f"</{active.pop()[0]}>")
+        for mk in uniq[keep:]:
+            out.append(mk[1])
+            active.append(mk)
+        out.append(html_piece)
+    while active:
+        out.append(f"</{active.pop()[0]}>")
+    return "".join(out)
+
+
+def _render_children(children: list, wrap: bool) -> str:
+    """Block-level rendering of a container's children. With `wrap`, loose inline content is
+    split on newlines into <p> paragraphs and images are lifted out into top-level blocks;
+    without it (ul/ol/table parts) only element children are kept - stray whitespace between
+    <li>s is dropped, as the editor would."""
+    out: list[str] = []
+    line: list[str] = []
+
+    def flush() -> None:
+        html = _trim_edges(_canon_marks("".join(line).strip()))
+        line.clear()
+        if html:
+            out.append(f"<p>{html}</p>")
+
+    pending_blank = False
+
+    def blank() -> None:
+        nonlocal pending_blank
+        pending_blank = True
+
+    for c in children:
+        if _is_block(c):
+            flush()
+            pending_blank = False
+            out.append(_render_block(c))
+        elif not wrap:
+            if isinstance(c, _Node):
+                out.append(_render_block(c))
+        elif isinstance(c, _Node) and c.tag == "img" and not dict(c.attrs).get("src"):
+            continue  # e.g. Asana's "Media was deleted" - the editor drops an <img> with no src
+        elif isinstance(c, _Node) and c.tag == "img":
+            flush()
+            pending_blank = False
+            out.append(_open_tag(c))
+        elif isinstance(c, str):
+            parts = c.split("\n")
+            for i, part in enumerate(parts):
+                if i > 0:
+                    if "".join(line).strip():
+                        flush()
+                    elif out and out[-1].startswith("<p>") and out[-1] != "<p></p>":
+                        blank()  # a blank line between two text paragraphs (not after a block)
+                if part.strip() or (part and line):
+                    if pending_blank and out and out[-1] != "<p></p>":
+                        out.append("<p></p>")
+                    pending_blank = False
+                    line.append(_esc_text(part))
+        else:
+            if pending_blank and out and out[-1] != "<p></p>":
+                out.append("<p></p>")
+            pending_blank = False
+            line.append(_render_inline(c))
+    flush()
+    return "".join(out)
+
+
+def _normalize_blocks(html: str) -> str:
+    if not html.strip():
+        return ""
+    builder = _TreeBuilder()
+    # A bare "&" (e.g. "?a=1&t=2" in text) must stay as-is; the parser would otherwise
+    # read "&t" as an entity. Escape every ampersand that isn't already an entity.
+    builder.feed(re.sub(r"&(?!#?[A-Za-z0-9]+;)", "&amp;", html))
+    builder.close()
+    return _render_children(builder.root.children, wrap=True)
 
 
 def format_all_tasks(

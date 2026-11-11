@@ -130,6 +130,8 @@ def h_build_task_pass1(ctx: BuildContext, payload: dict) -> None:
         task=task, stories=stories, comments=comments,
         task_created_by_email=created_by_email, registry=ctx.ref.registry,
     )
+    for row in activity_log:
+        row["task_uuid"] = task_uuid  # compiled task_activity_log.json is flat - rows must say which task
     write_json(out_dir / "activity_log.json", activity_log)
 
     assignee_email = email_of(task.get("assignee"))
@@ -327,7 +329,7 @@ def _uploaded_attachments_path(build_dir: Path, task_gid: str) -> Path:
 
 # --- queueing / pass 2 / compile -------------------------------------------
 
-def queue_pass1_jobs(data_paths: Paths, queue: JobQueue) -> int:
+def queue_pass1_jobs(data_paths: Paths, queue: JobQueue, rebuild: bool = False) -> int:
     # One `push_many()` call for the whole batch, not one `push()` per task:
     # `push()` re-reads/re-writes the entire (ever-growing) jobs file on
     # every call, so looping it over thousands of tasks is O(n^2) and, since
@@ -338,7 +340,7 @@ def queue_pass1_jobs(data_paths: Paths, queue: JobQueue) -> int:
         for task_dir in iter_all_task_dirs(data_paths)
     ]
     log.info("Found %d task(s) on disk, queueing...", len(items))
-    return queue.push_many(items)
+    return queue.push_many(items, requeue_done=rebuild)
 
 
 def _gid_to_uuid_path(build_dir: Path) -> Path:
@@ -416,7 +418,9 @@ def compile_build(build_dir: Path) -> dict[str, int]:
             task_collaborators.extend(read_json(task_dir / "task_collaborators.json", default=[]) or [])
             task_attachments.extend(read_json(task_dir / "attachments.json", default=[]) or [])
             comment_attachments.extend(read_json(task_dir / "comment_attachments.json", default=[]) or [])
-            activity_rows.extend(read_json(task_dir / "activity_log.json", default=[]) or [])
+            for row in read_json(task_dir / "activity_log.json", default=[]) or []:
+                row.setdefault("task_uuid", task["uuid"])  # older per-task files predate the stamp
+                activity_rows.append(row)
 
     # section_task's `order` needs every task in a section known at once -
     # assigned here, at compile time, ordered by each task's own created_at

@@ -147,7 +147,23 @@ def build_person_registry(data_paths: Paths) -> PersonRegistry:
                     scan_html(story.get("html_text"))
 
     _resolve_bare_profile_links(registry, profile_texts)
+    _overlay_mapped_emails(registry)
     return registry
+
+
+def _overlay_mapped_emails(registry: PersonRegistry) -> None:
+    """Asana users whose email Asana hides ("Private User", deleted users,
+    people with only a name) have an empty `email` in the export, so every
+    task/comment/collaborator row they touch would lose them. `build/
+    user_to_asana_gid.json` (after `padmasana-create-placeholder-users`)
+    carries a usable email for them - fill only the blanks from it."""
+    from . import config
+    user_map = read_json(config.BUILD_DIR / "user_to_asana_gid.json", default={}) or {}
+    for gid, person in registry.items():
+        if not person.get("email"):
+            mapped = (user_map.get(gid) or {}).get("email")
+            if mapped:
+                person["email"] = mapped
 
 
 def _resolve_bare_profile_links(registry: PersonRegistry, profile_texts: dict[str, set[str]]) -> None:
