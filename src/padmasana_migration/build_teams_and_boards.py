@@ -64,6 +64,7 @@ def build(data_paths: Paths, team_owner_overrides: dict[str, str] | None = None,
         log.warning("No user map in build/ - *_reference_code fields will be null. Run import-users, "
                     "create-placeholder-users and map-users first.")
     ref = (lambda email: resolver.ref(email)) if resolver else (lambda email: None)
+    system_email = resolver.system_email if resolver else None
 
     existing_team_uuids = _existing_uuids(build_dir, "teams.json")
     existing_board_uuids = _existing_uuids(build_dir, "boards.json")
@@ -141,7 +142,7 @@ def build(data_paths: Paths, team_owner_overrides: dict[str, str] | None = None,
                 if project_gid not in boards:
                     board = _build_board(
                         data_paths, workspace_dir, project_gid, registry, sections,
-                        existing_board_uuids, existing_section_uuids,
+                        existing_board_uuids, existing_section_uuids, system_email,
                     )
                     if board is None:
                         continue
@@ -159,6 +160,13 @@ def build(data_paths: Paths, team_owner_overrides: dict[str, str] | None = None,
                                 "member_reference_code": ref(email),
                                 "role": "admin" if email.lower() == board["created_by_email"].lower() else "member",
                             })
+                    if board["created_by_email"].lower() not in seen_board_members:
+                        board_members.append({
+                            "board_uuid": board["uuid"],
+                            "member_email": board["created_by_email"],
+                            "member_reference_code": board["created_by_reference_code"],
+                            "role": "admin",
+                        })
 
                 if team_uuid is not None:
                     board_uuid = board_uuid_by_project_gid.get(project_gid)
@@ -217,6 +225,7 @@ def _build_tags(data_paths: Paths, existing_tag_uuids: dict[str, str]) -> list[d
 def _build_board(
     data_paths: Paths, workspace_dir: Path, project_gid: str, registry: dict, sections_out: list[dict],
     existing_board_uuids: dict[str, str], existing_section_uuids: dict[str, str],
+    system_email: str | None = None,
 ) -> dict | None:
     project_dir = data_paths.find_project_dir_anywhere(project_gid) or data_paths.project_dir(workspace_dir, project_gid)
     project_json = read_json(project_dir / "project.json", default=None)
@@ -230,9 +239,17 @@ def _build_board(
 
     members = read_json(project_dir / "members.json", default=[]) or project_json.get("members", []) or []
     created_by_email, source = resolve_owner_email(members, registry)
+    if not created_by_email and system_email:
+        created_by_email, source = system_email, "system"
+        log.warning(
+            "Project '%s' (%s): no resolvable creator (no members with a known email) - "
+            "using the system user %s.",
+            project_json.get("name"), project_gid, system_email,
+        )
     if not created_by_email:
         log.warning(
-            "Project '%s' (%s): no resolvable creator (no members with a known email) - skipping this board.",
+            "Project '%s' (%s): no resolvable creator and no system user in build/placeholder_users.json "
+            "- skipping this board.",
             project_json.get("name"), project_gid,
         )
         return None

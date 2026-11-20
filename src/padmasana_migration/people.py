@@ -301,6 +301,7 @@ class RefResolver:
                     self.by_email[u[key].strip().lower()] = ref
         system = (read_json(build_dir / "placeholder_users.json", default={}) or {}).get(SYSTEM_USER_KEY) or {}
         self.system_ref: str | None = system.get("user_reference_code")
+        self.system_email: str | None = system.get("email")
         self.loaded = bool(self.by_email)
 
     def ref(self, email: str | None) -> str | None:
