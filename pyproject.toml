@@ -26,6 +26,7 @@ padmasana-create-placeholder-users = "padmasana_migration.main:create_placeholde
 padmasana-build-teams-and-boards = "padmasana_migration.main:build_teams_and_boards_main"
 padmasana-upload-attachments = "padmasana_migration.main:upload_attachments_main"
 padmasana-build-tasks = "padmasana_migration.main:build_tasks_main"
+padmasana-package-build = "padmasana_migration.main:package_build_main"
 padmasana-format-docs = "padmasana_migration.main:format_docs_main"
 padmasana-inspect-task = "padmasana_migration.main:inspect_task_main"
 job-status = "asana_migration.main:job_status_main"

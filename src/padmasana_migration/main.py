@@ -381,6 +381,66 @@ def _cmd_build_tasks(args: argparse.Namespace) -> None:
     report_missing_users(config.BUILD_DIR)
 
 
+PACKAGE_BUILD_FILES = (
+    "padmasana_users.json",
+    "teams.json",
+    "team_members.json",
+    "boards.json",
+    "sections.json",
+    "board_teams.json",
+    "board_members.json",
+    "board_sections.json",
+    "tags.json",
+    "tasks.json",
+    "section_tasks.json",
+    "task_tags.json",
+    "attachments.json",
+    "task_collaborators.json",
+    "comments.json",
+    "comment_attachments.json",
+    "task_activity_log.json",
+)
+
+
+def _cmd_package_build(args: argparse.Namespace) -> None:
+    _configure_logging(args.verbose)
+
+    import tarfile
+    from pathlib import Path
+    from . import config
+
+    output = Path(args.output) if args.output else config.BUILD_DIR.parent / "asana-build.tar.gz"
+    missing = [name for name in PACKAGE_BUILD_FILES if not (config.BUILD_DIR / name).is_file()]
+    if missing:
+        raise SystemExit(f"Missing build files in {config.BUILD_DIR}: {', '.join(missing)}")
+
+    log.info("Packaging %d files from %s into %s ...", len(PACKAGE_BUILD_FILES), config.BUILD_DIR, output)
+    with tarfile.open(output, "w:gz") as archive:
+        for name in PACKAGE_BUILD_FILES:
+            archive.add(config.BUILD_DIR / name, arcname=name)
+    log.info("Archive written to %s (%d bytes)", output, output.stat().st_size)
+
+    pad_cfg = config.get_padmasana_config()
+    file_service_url = args.file_service_url or pad_cfg.get("file_service_url")
+    file_service_path = args.file_service_path or pad_cfg.get("file_service_path") or "asana-build"
+
+    if not file_service_url:
+        log.info(
+            "=== Done. No file service url (pass --file-service-url or run upload-attachments first); "
+            "upload %s manually and use its uuid ===",
+            output,
+        )
+        return
+
+    from .file_service_client import FileServiceClient
+
+    log.info("Uploading archive to file service at %s ...", file_service_url)
+    file_client = FileServiceClient(file_service_url.rstrip("/"), token=args.file_service_token)
+    response = file_client.upload_file(file_path=output, path=file_service_path, name=output.name)
+    uuid = response.get("uuid")
+    log.info("=== Done: archive uploaded, file reference uuid = %s ===", uuid)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="padmasana-migration")
     sub = parser.add_subparsers(dest="command")
@@ -484,6 +544,17 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_task_parser.add_argument("-v", "--verbose", action="store_true")
     inspect_task_parser.set_defaults(func=_cmd_inspect_task)
 
+    package_build = sub.add_parser(
+        "package-build",
+        help="Archive the flat build files the padmasana-service importer reads into a tar.gz and upload it to the file service.",
+    )
+    package_build.add_argument("--output", help="Output archive path (default: <build>/../asana-build.tar.gz).")
+    package_build.add_argument("--file-service-url", help="File service base URL (defaults to the one saved by upload-attachments); the archive is uploaded and its uuid printed.")
+    package_build.add_argument("--file-service-token", help="Bearer token for the file service, if it requires one.")
+    package_build.add_argument("--file-service-path", help="Storage path on the file service (defaults to the saved one, else asana-build).")
+    package_build.add_argument("-v", "--verbose", action="store_true")
+    package_build.set_defaults(func=_cmd_package_build)
+
     return parser
 
 
@@ -526,6 +597,10 @@ def format_docs_main() -> None:
 
 def inspect_task_main() -> None:
     main(["inspect-task", *sys.argv[1:]])
+
+
+def package_build_main() -> None:
+    main(["package-build", *sys.argv[1:]])
 
 
 if __name__ == "__main__":
